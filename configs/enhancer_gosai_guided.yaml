@@ -1,0 +1,73 @@
+name: enhancer_model
+seed: 42
+
+model:
+  mode: dirichlet
+  model: cnn
+  checkpoint_path: /lustre/scratch126/cellgen/lotfollahi/dj16/data/workdir_from_DirichletFM/DNA_diri_target2_valOnTrain_noDropoutEval_2024-01-08_10-11-25/best.ckpt
+  clean_data: False
+  alphabet_size: 4
+  alpha_max: 2.0
+  alpha_scale: 1.0
+  fix_alpha: 1.0
+  num_cls: 1
+  cls_expanded_simplex: True
+  hidden_dim: 128
+  num_cnn_stacks: 5
+  dropout: 0.1
+  cls_free_guidance: False
+
+dataset:
+  name: gosai
+  data_path: /lustre/scratch126/cellgen/lotfollahi/dj16/data/sequence_data/enhancer_gosai_DRAKES/processed_data/gosai_all.csv
+  seq_length: 200
+  streaming: False
+
+loader:
+  global_batch_size: 64
+  eval_global_batch_size: 32
+  batch_size: 64
+  eval_batch_size: 32
+  num_workers: 4
+  pin_memory: True
+
+# ---------- ensemble property predictor (mu_hat, sigma2_hat) ----------
+ensemble:
+  num_members: 5
+  hidden_dim: 128
+  depth: 4
+  dropout: 0.1
+  target_idx: 0      # 0=hepg2, 1=k562, 2=sknsh
+  checkpoint_path: ./runs/ensemble/ensemble.ckpt
+
+# ---------- inference-time guided velocity field ----------
+# u* = u_t + alpha*grad mu_hat - beta*grad sigma2_hat - (1-sqrt(lambda))*grad log p_t
+sampling:
+  predictor: ddpm
+  n_steps: 128
+  flow_temp: 1.0
+  prior_pseudocount: 0.1
+  alpha_guidance:    1.0     # property guidance strength
+  beta_uncertainty:  1.0     # activity-cliff penalty strength
+  ood_lambda:        0.0     # 0 = in-distribution, ->1 = novelty / OOD push
+  gamma_rank:        1.0     # ranking: -gamma * sigma_hat
+  delta_rank:        0.0     # ranking: +delta * novelty(x)
+  num_sample_batches: 2
+
+train:
+  num_epochs: 5
+  lr: 0.0001
+  lr_step_size: 10
+  lr_gamma: 0.5
+  batch_size: 64
+  accumulate_grad_batches: 1
+
+eval:
+  batch_size: 32
+
+optim:
+  weight_decay: 0.0
+  lr: 0.0001
+  beta1: 0.9
+  beta2: 0.999
+  eps: 0.00000001
