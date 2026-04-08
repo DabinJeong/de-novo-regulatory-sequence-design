@@ -1,0 +1,76 @@
+name: enhancer_model 
+seed: 42
+
+model:
+  mode: dirichlet
+  model: cnn
+  checkpoint_path: /lustre/scratch126/cellgen/lotfollahi/dj16/data/workdir_from_DirichletFM/DNA_diri_target2_valOnTrain_noDropoutEval_2024-01-08_10-11-25/best.ckpt
+  prop_pred_checkpoint_path: TODO
+  clean_data: False
+  alphabet_size: 4
+  alpha_max: 2.0
+  alpha_scale: 1.0
+  fix_alpha: 1.0
+  num_cls: 1
+  cls_expanded_simplex: True
+  hidden_dim: 128
+  num_cnn_stacks: 5
+  dropout: 0.1 
+  cls_free_guidance: False
+
+dataset:
+  name: gosai
+  data_path: /lustre/scratch126/cellgen/lotfollahi/dj16/data/sequence_data/enhancer_gosai_DRAKES/processed_data/gosai_all.csv
+  seq_length: 200
+  streaming: False
+
+loader:
+  global_batch_size: 5
+  eval_global_batch_size: 5
+  # Note: batch_size and eval_batch_size are **per machine**
+  batch_size: 5
+  eval_batch_size: 5
+  num_workers: 4
+  pin_memory: True
+
+sampling:
+  predictor: ddpm 
+  n_steps: 128
+  noise_removal: True
+  num_sample_batches: 2  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
+  num_sample_log: 2
+  semi_ar: False
+  stride_length: 1
+  num_strides: 1
+
+train:
+  num_epochs: 5
+  ema: 0.9999
+  antithetic_sampling: True
+  importance_sampling: False
+  sampling_eps: 0.0001
+  change_of_variables: False
+  accumulate_grad_batches: 1
+  batch_size: 5
+  eps: 0.00001
+  lr: 0.0001 
+  lr_step_size: 10
+  lr_gamma: 0.5
+
+eval:
+  batch_size: 5
+  checkpoint_path: ''  # Used to evaluate a checkpoint after training.
+  disable_ema: False
+  compute_generative_perplexity: True # False
+  perplexity_batch_size: 8
+  compute_perplexity_on_sanity: False
+  gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
+  generate_samples: True
+  subset_size: 5000
+
+optim:
+  weight_decay: 0
+  lr: 0.00001
+  beta1: 0.9
+  beta2: 0.999
+  eps: 0.00000001
