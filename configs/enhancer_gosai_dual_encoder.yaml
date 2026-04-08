@@ -1,0 +1,48 @@
+name: enhancer_model
+seed: 42
+
+model:
+  mode: dirichlet
+  model: cnn
+  checkpoint_path: ""     # train from scratch; not loading FM backbone
+  alphabet_size: 4
+  alpha_max: 2.0
+  alpha_scale: 1.0
+  fix_alpha: 1.0
+  num_cls: 1
+  cls_expanded_simplex: True
+  hidden_dim: 128
+  num_cnn_stacks: 5
+  dropout: 0.1
+  cls_free_guidance: False
+
+dataset:
+  name: gosai
+  data_path: /lustre/scratch126/cellgen/lotfollahi/dj16/data/sequence_data/enhancer_gosai_DRAKES/processed_data/gosai_all.csv
+  seq_length: 200
+  streaming: False
+
+loader:
+  global_batch_size: 64
+  eval_global_batch_size: 32
+  batch_size: 64
+  eval_batch_size: 32
+  num_workers: 4
+  pin_memory: True
+
+# ---------- dual encoder (semantic / variation) ----------
+dual_encoder:
+  num_envs: 3        # hepg2 / k562 / sknsh
+  sem_dim: 64
+  var_dim: 64
+  lambda_inv: 1.0    # L_inv(s) weight  -- semantic invariance
+  lambda_div: 1.0    # L_div(v) weight  -- variation diversification
+
+train:
+  num_epochs: 20
+  lr: 0.0001
+  batch_size: 64
+  accumulate_grad_batches: 1
+
+optim:
+  weight_decay: 0.0
