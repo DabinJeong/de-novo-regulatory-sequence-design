@@ -1,22 +1,36 @@
 """
-Inference-time guided Dirichlet FM sampler (proposal: slide 14-15).
+Inference-time guided Dirichlet FM sampler — **GIL edition**.
 
-Implements:
+Velocity field:
 
-    u*(x_t) = u_t(x_t)                               # frozen Dirichlet FM backbone
-            + alpha * grad mu_hat(x_t)               # property guidance
-            - beta  * grad sigma2_hat(x_t)           # uncertainty penalty (activity cliff)
-            - (1 - sqrt(lambda)) * grad log p_t(x_t) # OOD / novelty knob
+    u*(x_t) = u_t(x_t)                              # frozen Dirichlet FM backbone
+            + alpha * grad mu_hat(x_t)              # property guidance (ensemble)
+            - beta  * grad sigma2_hat(x_t)          # uncertainty penalty
+            + eta   * grad y_st(x_t)                # x_st should predict high y
+            + xi    * sqrt(lambda) * grad_en_push(x_t)  # x_en pushed off known envs
 
-The backbone weights are NOT updated. All steering happens at solve time
-through the velocity field, exactly as described in the proposal:
-"Solver-level steering only — no weight update, no fine-tuning".
+The separator is trained under GIL-style V-REx invariance, so:
+  * y_st is guaranteed (modulo training error) to be env-invariant, hence
+    pulling x_st towards high y does not interact with background shift;
+  * x_en contains environment-specific information by construction, hence
+    pushing it away from the *nearest* training env centroid is a principled
+    realisation of MOOD-style OOD novelty control.
+
+At inference we:
+    M     = separator(xt, t)
+    x_st  = xt * M
+    x_en  = xt * (1 - M)
+    grad_y_st    = d/dxt  y_head(x_st, t)
+    grad_en_push = d/dxt  min_k || embed_en(x_en, t) - centroid_k ||^2
+
+`env_centroids` are loaded from the dual-encoder checkpoint (the trainer
+saves them alongside the model weights after the final K-means run).
+
+The backbone weights are NOT updated. All steering happens at solve time.
 
 Modes:
     lambda = 0  -> in-distribution sampling
-    lambda -> 1 -> stronger novelty / OOD push
-
-Ranking score (proposal): score(x) = mu_hat - gamma * sigma_hat + delta * novelty(x)
+    lambda -> 1 -> stronger environmental-background push (OOD via v-shift)
 """
 
 import os
@@ -27,15 +41,16 @@ import torch.nn.functional as F
 from sequence_generation.utils.flow_utils import (
     DirichletConditionalFlow, expand_simplex,
 )
-from sequence_generation.utils.train_utils import load_generator
+from sequence_generation.utils.train_utils import load_generator, load_dataloader
 from sequence_generation.model.ensemble_regressor import EnsembleRegressor
+from sequence_generation.model.dual_encoder import DualEncoderModel
 
 
 INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
 
 
 class GuidedSampler:
-    """Frozen Dirichlet FM backbone + ensemble-guided velocity field."""
+    """Frozen Dirichlet FM backbone + ensemble + GIL separator guidance."""
 
     def __init__(self, config):
         self.config = config
@@ -63,46 +78,104 @@ class GuidedSampler:
             depth=ens_cfg.get("depth", 4),
             dropout=ens_cfg.get("dropout", 0.1),
         )
-        ckpt_path = ens_cfg.get("checkpoint_path", None)
-        if ckpt_path and os.path.exists(ckpt_path):
-            sd = torch.load(ckpt_path, map_location="cpu")
+        ens_ckpt = ens_cfg.get("checkpoint_path", None)
+        if ens_ckpt and os.path.exists(ens_ckpt):
+            sd = torch.load(ens_ckpt, map_location="cpu")
             self.ensemble.load_state_dict(sd.get("model", sd))
-            print(f"[GuidedSampler] loaded ensemble checkpoint from {ckpt_path}")
+            print(f"[GuidedSampler] loaded ensemble checkpoint from {ens_ckpt}")
         else:
-            print(f"[GuidedSampler] WARNING: no ensemble checkpoint at {ckpt_path}; "
-                  f"using randomly initialised property predictor.")
+            raise FileNotFoundError(
+                f"Ensemble checkpoint required but not found at {ens_ckpt}. "
+                "Train with `scripts.main_guided --train_ensemble` first."
+            )
         self.ensemble.to(self.device).eval()
+        for p in self.ensemble.parameters():
+            p.requires_grad_(False)
+
+        # ---- GIL-style separator ------------------------------------------
+        self.dual_encoder = DualEncoderModel(config)
+        de_cfg = config.get("dual_encoder", {})
+        de_ckpt = de_cfg.get("checkpoint_path", None)
+        if de_ckpt and os.path.exists(de_ckpt):
+            ckpt = torch.load(de_ckpt, map_location="cpu")
+            self.dual_encoder.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
+            print(f"[GuidedSampler] loaded dual-encoder checkpoint from {de_ckpt}")
+            # Try to load env centroids saved by the trainer
+            env_centroids = ckpt.get("env_centroids", None) if isinstance(ckpt, dict) else None
+        else:
+            raise FileNotFoundError(
+                f"Dual-encoder checkpoint required but not found at {de_ckpt}. "
+                "Train with `scripts.dual_encoder_trainer` first."
+            )
+        self.dual_encoder.to(self.device).eval()
+        for p in self.dual_encoder.parameters():
+            p.requires_grad_(False)
 
         # ---- guidance hyper-parameters ------------------------------------
         s = config.sampling
-        self.alpha_g  = s.get("alpha_guidance", 1.0)   # property weight
-        self.beta_g   = s.get("beta_uncertainty", 1.0) # uncertainty penalty
-        self.lam      = s.get("ood_lambda", 0.0)       # 0..1 novelty knob
-        self.gamma_r  = s.get("gamma_rank", 1.0)       # ranking penalty on sigma
-        self.delta_r  = s.get("delta_rank", 0.0)       # ranking bonus on novelty
+        self.alpha_g  = s.get("alpha_guidance", 1.0)     # property weight
+        self.beta_g   = s.get("beta_uncertainty", 1.0)   # uncertainty penalty
+        self.eta_st   = s.get("eta_stable", 1.0)         # stable sufficiency push
+        self.xi_en    = s.get("xi_en_push", 1.0)         # env-push (v-shift)
+        self.lam      = s.get("ood_lambda", 0.0)         # 0..1 novelty knob
+        self.gamma_r  = s.get("gamma_rank", 1.0)         # ranking penalty on sigma
+        self.delta_r  = s.get("delta_rank", 0.0)         # ranking bonus on novelty
         self.n_steps  = s.get("n_steps", 128)
         self.flow_temp = s.get("flow_temp", 1.0)
         self.prior_pseudocount = s.get("prior_pseudocount", 0.1)
 
-    # ----------------------------------------------------------------------
-    # property + uncertainty gradients in the simplex space
-    # ----------------------------------------------------------------------
+        # ---- env centroids: either from checkpoint or recompute ----------
+        if env_centroids is not None:
+            self.env_centroids = env_centroids.to(self.device)
+            print(f"[GuidedSampler] loaded {self.env_centroids.size(0)} env centroids "
+                  f"from dual-encoder checkpoint (dim={self.env_centroids.size(-1)})")
+        else:
+            print("[GuidedSampler] no env_centroids in checkpoint; recomputing "
+                  "from training data (single-centroid fallback).")
+            self.env_centroids = self._precompute_en_centroid(
+                n_samples=de_cfg.get("n_en_centroid_samples", 2048),
+            )
 
+    # ----------------------------------------------------------------------
+    # fallback: single global centroid if checkpoint didn't save per-env ones
+    # ----------------------------------------------------------------------
+    @torch.no_grad()
+    def _precompute_en_centroid(self, n_samples: int) -> torch.Tensor:
+        train_loader, _, _ = load_dataloader(self.config)
+        collected = 0
+        feats = []
+        alpha_max = float(self.config.model.alpha_max)
+        for batch in train_loader:
+            x = batch["seqs"].to(self.device)
+            B = x.size(0)
+            t = torch.full((B,), alpha_max, device=self.device)
+            _, _, x_en = self.dual_encoder.separate(x, t=t, soft_input=False)
+            h_en = self.dual_encoder.embed_en(x_en, t)        # (B, H)
+            feats.append(h_en)
+            collected += B
+            if collected >= n_samples:
+                break
+        feats = torch.cat(feats, dim=0)
+        centroid = feats.mean(dim=0, keepdim=True)           # (1, H)
+        return centroid.detach()
+
+    # ----------------------------------------------------------------------
+    # ensemble gradients (property + uncertainty)
+    # ----------------------------------------------------------------------
     def _mu_sigma2_grads(self, xt: torch.Tensor):
         """
-        Returns (grad_mu, grad_sigma2, mu, sigma2), each grad of shape (B,L,K).
-        xt is a soft simplex point; the ensemble is differentiated through it.
+        Returns (grad_mu, grad_sigma2, mu, sigma2), each grad shape (B,L,K).
+
+        NOTE: the manual forward here bypasses SeqRegressor's embedder by
+        feeding a soft-mixture embedding. It must stay in sync with
+        SeqRegressor's architecture. Outstanding review item: #1.
         """
         B, L, K = xt.shape
         x = xt.detach().clone().requires_grad_(True)
 
-        # The SeqRegressor expects a token-id tensor via x['seqs']; we
-        # bypass the embedding by feeding the soft mixture directly.
-        # ensemble member -> SeqRegressor: we re-use the embedder weights as
-        # a (A, hidden) matrix and form the soft embedding x @ W.
         preds = []
         for m in self.ensemble.members:
-            W = m.embedder.weight                      # (A, H)
+            W = m.embedder.weight
             soft_emb = torch.einsum("blk,kh->blh", x, W)
             h = soft_emb.transpose(1, 2)
             xs = [soft_emb]
@@ -112,23 +185,59 @@ class GuidedSampler:
             feat = torch.cat(xs, dim=-1)
             gate = m.sigmoid_linear(feat) * m.tanh_linear(feat)
             pooled = torch.tanh(gate.mean(dim=1))
-            preds.append(m.final_linear(pooled))       # (B,1)
-        preds = torch.stack(preds, dim=0)              # (K_ens, B, 1)
-        mu = preds.mean(0)                             # (B,1)
-        var = preds.var(0, unbiased=False)             # (B,1)
+            preds.append(m.final_linear(pooled))
+        preds = torch.stack(preds, dim=0)                    # (K_ens, B, 1)
+        mu = preds.mean(0)
+        var = preds.var(0, unbiased=False)
 
         grad_mu = torch.autograd.grad(mu.sum(), x, retain_graph=True)[0]
         grad_var = torch.autograd.grad(var.sum(), x, retain_graph=False)[0]
 
-        # zero-mean over the simplex axis (consistent with classifier guidance)
         grad_mu  = grad_mu  - grad_mu.mean(-1, keepdim=True)
         grad_var = grad_var - grad_var.mean(-1, keepdim=True)
         return grad_mu.detach(), grad_var.detach(), mu.detach(), var.detach()
 
     # ----------------------------------------------------------------------
+    # GIL separator gradients (stable-sufficiency + env-push)
+    # ----------------------------------------------------------------------
+    def _gil_grads(self, xt: torch.Tensor, t_batch: torch.Tensor):
+        """
+        Returns (grad_stable, grad_en_push), each (B, L, K).
+
+        grad_stable  : direction increasing y_head(x_st, t)
+        grad_en_push : direction increasing the min-distance from h_en(x_en, t)
+                       to the set of training env centroids
+        """
+        x = xt.detach().clone().requires_grad_(True)
+
+        M = self.dual_encoder.separator(x, t_batch)              # (B, L)
+        M3 = M.unsqueeze(-1)
+        x_st = x * M3
+        x_en = x * (1.0 - M3)
+
+        # (1) stable-sufficiency
+        y_st = self.dual_encoder.predict_y_from_st(x_st, t_batch)  # (B, 1)
+        grad_stable = torch.autograd.grad(
+            y_st.sum(), x, retain_graph=True,
+        )[0]
+
+        # (2) env push: distance to NEAREST env centroid
+        h_en = self.dual_encoder.embed_en(x_en, t_batch)           # (B, H)
+        #   (B, H) vs (K, H)  ->  (B, K) squared distances
+        d2 = torch.cdist(h_en, self.env_centroids, p=2) ** 2       # (B, K)
+        nearest = d2.min(dim=-1).values                            # (B,)
+        en_obj = nearest.mean()
+        grad_en_push = torch.autograd.grad(
+            en_obj, x, retain_graph=False,
+        )[0]
+
+        grad_stable  = grad_stable  - grad_stable.mean(-1, keepdim=True)
+        grad_en_push = grad_en_push - grad_en_push.mean(-1, keepdim=True)
+        return grad_stable.detach(), grad_en_push.detach()
+
+    # ----------------------------------------------------------------------
     # main sampling loop
     # ----------------------------------------------------------------------
-
     def sample(self, B: int, L: int):
         device = self.device
         K = self.K
@@ -154,22 +263,21 @@ class GuidedSampler:
             c_factor = self.condflow.c_factor(xt.cpu().numpy(), s.item())
             c_factor = torch.from_numpy(c_factor).to(xt)
             cond_flows = (eye - xt.unsqueeze(-1)) * c_factor.unsqueeze(-2)
-            u_t = (flow_probs.unsqueeze(-2) * cond_flows).sum(-1)   # (B,L,K)
+            u_t = (flow_probs.unsqueeze(-2) * cond_flows).sum(-1)
 
-            # ---- ensemble guidance terms ---------------------------------
+            # ---- ensemble guidance ----------------------------------------
             grad_mu, grad_var, _, _ = self._mu_sigma2_grads(xt)
 
-            # ---- novelty / OOD term: -(1 - sqrt(lambda)) * grad log p_t ---
-            # The Dirichlet FM "score" can be approximated from u_t under the
-            # conditional flow factorisation; we use grad log p_t ~ u_t / g_t
-            # with g_t absorbed into the lambda knob (matches MOOD / proposal).
-            novelty_term = -(1.0 - self.lam ** 0.5) * u_t
+            # ---- GIL separator guidance -----------------------------------
+            t_batch = s[None].expand(B)
+            grad_stable, grad_en_push = self._gil_grads(xt, t_batch)
 
             u_star = (
                 u_t
                 + self.alpha_g * grad_mu
                 - self.beta_g  * grad_var
-                + novelty_term
+                + self.eta_st  * grad_stable
+                + self.xi_en * (self.lam ** 0.5) * grad_en_push
             )
 
             xt = (xt + u_star * (t - s)).clamp(min=1e-8)
@@ -181,22 +289,14 @@ class GuidedSampler:
     # ----------------------------------------------------------------------
     # ranking: score(x) = mu_hat - gamma * sigma_hat + delta * novelty(x)
     # ----------------------------------------------------------------------
-
     @torch.no_grad()
     def score_and_rank(self, seqs: torch.Tensor, ref_seqs: torch.Tensor = None):
-        """
-        seqs: (B, L) token ids
-        ref_seqs: (N, L) optional in-distribution reference set for novelty
-                  (Hamming distance to nearest neighbour, normalised by L).
-        Returns dict(score, mu, sigma, novelty), each (B,).
-        """
         mu, var = self.ensemble.mu_sigma2({"seqs": seqs.to(self.device)})
         mu = mu.squeeze(-1)
         sigma = var.clamp_min(1e-12).sqrt().squeeze(-1)
 
         if ref_seqs is not None and ref_seqs.numel() > 0:
             r = ref_seqs.to(self.device)
-            # min Hamming distance to reference, normalised
             d = (seqs.to(self.device).unsqueeze(1) != r.unsqueeze(0)).float().mean(-1)
             novelty = d.min(dim=1).values
         else:
@@ -209,7 +309,6 @@ class GuidedSampler:
 # ===========================================================================
 # CLI driver
 # ===========================================================================
-
 def main():
     import argparse, yaml
     from ml_collections.config_dict import ConfigDict
