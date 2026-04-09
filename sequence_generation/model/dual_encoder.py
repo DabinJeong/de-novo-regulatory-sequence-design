@@ -127,9 +127,10 @@ def mask_regularisation(M: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
       (2) fraction of "active" positions (M > 0.5) close to rho (bimodality)
     """
     mean_term = (M.mean() - rho) ** 2
-    active_frac = (M > 0.5).float().mean()
-    uneven_term = (active_frac - rho) ** 2
-    return mean_term + uneven_term
+    # Differentiable bimodality: penalise M*(1-M) so values are pushed
+    # toward {0, 1}. The previous (M > 0.5) indicator had no gradient.
+    bimodal_term = (M * (1.0 - M)).mean()
+    return mean_term + bimodal_term
 
 
 def v_rex_penalty(

@@ -26,6 +26,7 @@ so L_inv is zero and the model behaves like ERM on x_st.
 """
 
 import os
+import copy
 import argparse
 import yaml
 
@@ -106,8 +107,13 @@ class DualEncoderTrainer:
         self.out_dir = config.get("out_dir", "./runs/dual_encoder")
         os.makedirs(self.out_dir, exist_ok=True)
 
-        # env_ids cache: maps sample index (within the train dataset) -> env id
-        self._env_cache: torch.Tensor = None   # set after first env inference
+        # Frozen snapshot of the model used for env inference and per-batch
+        # env assignment throughout an epoch. GIL assumes env labels are fixed
+        # while the separator is being updated; we enforce this by deepcopying
+        # the model at env-inference time and never updating the snapshot
+        # until the next env-inference step.
+        self._env_model = None
+        self._env_centroids = None
 
     # ------------------------------------------------------------------
     @torch.no_grad()
@@ -134,7 +140,12 @@ class DualEncoderTrainer:
         centroid*. The trainer therefore caches the centroids, not raw
         labels.
         """
-        self.model.eval()
+        # Freeze a snapshot of the current model for the whole epoch, so
+        # env assignments do not drift as the live separator is updated.
+        self._env_model = copy.deepcopy(self.model).eval()
+        for p in self._env_model.parameters():
+            p.requires_grad_(False)
+
         feats = []
         alpha_max = float(self.config.model.alpha_max)
         collected = 0
@@ -142,8 +153,8 @@ class DualEncoderTrainer:
             x = batch["seqs"].to(self.device)
             B = x.size(0)
             t = torch.full((B,), alpha_max, device=self.device)
-            _, _, x_en = self.model.separate(x, t=t, soft_input=False)
-            h_en = self.model.embed_en(x_en, t)              # (B, H)
+            _, _, x_en = self._env_model.separate(x, t=t, soft_input=False)
+            h_en = self._env_model.embed_en(x_en, t)         # (B, H)
             feats.append(h_en)
             collected += B
             if collected >= self.kmeans_samples:
@@ -171,8 +182,10 @@ class DualEncoderTrainer:
         B = x.size(0)
         alpha_max = float(self.config.model.alpha_max)
         t = torch.full((B,), alpha_max, device=self.device)
-        _, _, x_en = self.model.separate(x, t=t, soft_input=False)
-        h_en = self.model.embed_en(x_en, t)                  # (B, H)
+        # Use the frozen snapshot so env ids stay consistent with the
+        # centroids that were fit at the start of this epoch.
+        _, _, x_en = self._env_model.separate(x, t=t, soft_input=False)
+        h_en = self._env_model.embed_en(x_en, t)             # (B, H)
         d2 = torch.cdist(h_en, self._env_centroids, p=2) ** 2
         return d2.argmin(dim=-1)                             # (B,)
 
@@ -198,8 +211,7 @@ class DualEncoderTrainer:
                 clss = batch["clss"].to(self.device)
 
                 # assign env ids using the cached centroids (if available)
-                if envs_ready or self._env_cache is not None or \
-                   hasattr(self, "_env_centroids"):
+                if self._env_model is not None and self._env_centroids is not None:
                     env_ids = self._assign_envs_for_batch(x)
                 else:
                     env_ids = None
