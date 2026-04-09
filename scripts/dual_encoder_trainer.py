@@ -1,16 +1,37 @@
 """
-Trainer for the dual (semantic / variation) encoder.
+Trainer for the GIL-style separator (see sequence_generation/model/dual_encoder.py).
 
 Usage:
     python -m scripts.dual_encoder_trainer \
         --config configs/enhancer_gosai_dual_encoder.yaml \
         --out_dir ./runs/dual_encoder
+
+Alternating optimisation (GIL §3)
+---------------------------------
+Each epoch:
+  (A) ENV INFERENCE STEP
+        Pass the training set through the current separator to collect x_en
+        embeddings, run K-means on them to get one env id per sample.
+        This env assignment is frozen for the next update step.
+
+  (B) SEPARATOR + Y-HEAD UPDATE STEP
+        For each minibatch, look up the cached env ids and call
+        model.compute_loss(x, clss, env_ids=...). The V-REx penalty
+        variance across envs drives the separator to find a mask
+        under which x_st -> y is invariant to the env (which is
+        derived from x_en).
+
+The very first epoch has no env labels yet (warmup): env_ids=None,
+so L_inv is zero and the model behaves like ERM on x_st.
 """
 
 import os
 import argparse
 import yaml
+
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm import tqdm
 from ml_collections.config_dict import ConfigDict
@@ -19,15 +40,46 @@ from sequence_generation.utils.train_utils import load_dataloader, load_seed
 from sequence_generation.model.dual_encoder import DualEncoderModel
 
 
-def env_id_from_batch(batch, num_envs: int) -> torch.Tensor:
+# ---------------------------------------------------------------------------
+# Simple K-means (PyTorch-only, no sklearn dependency)
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def kmeans_fit_predict(
+    X: torch.Tensor,
+    K: int,
+    n_iters: int = 20,
+    seed: int = 0,
+) -> torch.Tensor:
     """
-    Gosai batches expose 'clss' = (B, num_tasks). We pick the env label as
-    argmax of activity across tasks (i.e. the cell line where the sequence
-    is most active). Override here for a different env definition.
+    X: (N, D) feature matrix on any device.
+    Returns: (N,) long tensor of cluster ids in [0, K).
     """
-    return batch["clss"].argmax(dim=-1).clamp(max=num_envs - 1)
+    N, D = X.shape
+    device = X.device
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    init_idx = torch.randperm(N, generator=g)[:K].to(device)
+    centroids = X[init_idx].clone()                      # (K, D)
+
+    for _ in range(n_iters):
+        # assignment: (N, K) squared distances
+        d2 = torch.cdist(X, centroids, p=2) ** 2
+        assign = d2.argmin(dim=-1)                       # (N,)
+        # update
+        new_centroids = centroids.clone()
+        for k in range(K):
+            mask = assign == k
+            if mask.sum() > 0:
+                new_centroids[k] = X[mask].mean(dim=0)
+        shift = (new_centroids - centroids).norm()
+        centroids = new_centroids
+        if shift < 1e-5:
+            break
+    return assign
 
 
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
 class DualEncoderTrainer:
     def __init__(self, config):
         self.config = config
@@ -36,8 +88,14 @@ class DualEncoderTrainer:
         load_seed(config.seed)
         self.train_loader, self.eval_loader, _ = load_dataloader(config)
 
-        self.num_envs = config.get("dual_encoder", {}).get("num_envs", 3)
-        self.model = DualEncoderModel(config, num_envs=self.num_envs).to(self.device)
+        self.model = DualEncoderModel(config).to(self.device)
+
+        de_cfg = config.get("dual_encoder", {})
+        self.num_envs       = de_cfg.get("num_envs", 3)
+        self.warmup_epochs  = de_cfg.get("warmup_epochs", 1)
+        self.env_infer_every = de_cfg.get("env_infer_every", 1)   # epochs
+        self.kmeans_iters   = de_cfg.get("kmeans_iters", 20)
+        self.kmeans_samples = de_cfg.get("kmeans_samples", 8192)  # cap for speed
 
         self.optimizer = AdamW(
             self.model.parameters(),
@@ -48,38 +106,141 @@ class DualEncoderTrainer:
         self.out_dir = config.get("out_dir", "./runs/dual_encoder")
         os.makedirs(self.out_dir, exist_ok=True)
 
+        # env_ids cache: maps sample index (within the train dataset) -> env id
+        self._env_cache: torch.Tensor = None   # set after first env inference
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _infer_envs(self, epoch: int) -> torch.Tensor:
+        """
+        Sweep through the train loader once, collect x_en embeddings for up
+        to `kmeans_samples` samples, fit K-means, and return a (N_total,)
+        tensor of env ids (one per training sample, indexed in the order the
+        loader yields them — we rely on shuffle=True elsewhere so we also
+        need to key by original indices below).
+
+        To stay simple and robust under DataLoader shuffling, we instead
+        collect (batch_index_within_loader, env_id) pairs and rebuild a
+        per-step env_id tensor on the fly during the update pass. This
+        means: we do ONE pass to collect embeddings + cluster them, then
+        re-embed during the update pass using *exactly the same* mini-batch
+        order (we re-seed the shuffle).
+
+        For simplicity we just collect embeddings in the order the loader
+        produces them in this epoch, cluster them, and then the update pass
+        runs *a separate* loader iteration. Since batches differ, we cannot
+        reuse the clustering labels. Instead we embed x_en for the current
+        batch at update time and assign each sample to the *nearest stored
+        centroid*. The trainer therefore caches the centroids, not raw
+        labels.
+        """
+        self.model.eval()
+        feats = []
+        alpha_max = float(self.config.model.alpha_max)
+        collected = 0
+        for batch in tqdm(self.train_loader, desc=f"epoch {epoch+1} [infer envs]"):
+            x = batch["seqs"].to(self.device)
+            B = x.size(0)
+            t = torch.full((B,), alpha_max, device=self.device)
+            _, _, x_en = self.model.separate(x, t=t, soft_input=False)
+            h_en = self.model.embed_en(x_en, t)              # (B, H)
+            feats.append(h_en)
+            collected += B
+            if collected >= self.kmeans_samples:
+                break
+        feats = torch.cat(feats, dim=0)[: self.kmeans_samples]
+        assign = kmeans_fit_predict(feats, K=self.num_envs,
+                                    n_iters=self.kmeans_iters, seed=epoch)
+        # compute centroids from the assignment for downstream use
+        centroids = torch.stack([
+            feats[assign == k].mean(dim=0) if (assign == k).sum() > 0
+            else feats.mean(dim=0)
+            for k in range(self.num_envs)
+        ], dim=0)                                            # (K, H)
+        self._env_centroids = centroids.detach()
+        # log env distribution
+        counts = torch.bincount(assign, minlength=self.num_envs)
+        print(f"[env infer] cluster sizes: {counts.tolist()}  "
+              f"(of {feats.size(0)} sampled)")
+        return centroids
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _assign_envs_for_batch(self, x: torch.Tensor) -> torch.Tensor:
+        """Assign env id to each sample in the current batch using cached centroids."""
+        B = x.size(0)
+        alpha_max = float(self.config.model.alpha_max)
+        t = torch.full((B,), alpha_max, device=self.device)
+        _, _, x_en = self.model.separate(x, t=t, soft_input=False)
+        h_en = self.model.embed_en(x_en, t)                  # (B, H)
+        d2 = torch.cdist(h_en, self._env_centroids, p=2) ** 2
+        return d2.argmin(dim=-1)                             # (B,)
+
+    # ------------------------------------------------------------------
     def train(self):
         best = float("inf")
-        for epoch in range(self.config.train.num_epochs):
+        num_epochs = self.config.train.num_epochs
+
+        for epoch in range(num_epochs):
+            # ---- (A) env inference step (skipped during warmup) --------
+            envs_ready = False
+            if epoch >= self.warmup_epochs and (epoch % self.env_infer_every == 0):
+                self._infer_envs(epoch)
+                envs_ready = True
+
+            # ---- (B) separator + y-head update step --------------------
             self.model.train()
-            agg = {"loss": 0.0, "recon": 0.0, "inv": 0.0, "div": 0.0}
+            agg = {"loss": 0.0, "L_sta": 0.0, "L_reg": 0.0,
+                   "L_inv": 0.0, "rho": 0.0, "mask_mean": 0.0}
             n = 0
-            for batch in tqdm(self.train_loader, desc=f"epoch {epoch+1}"):
-                x       = batch["seqs"].to(self.device)
-                env_ids = env_id_from_batch(batch, self.num_envs).to(self.device)
+            for batch in tqdm(self.train_loader, desc=f"epoch {epoch+1} [update]"):
+                x    = batch["seqs"].to(self.device)
+                clss = batch["clss"].to(self.device)
+
+                # assign env ids using the cached centroids (if available)
+                if envs_ready or self._env_cache is not None or \
+                   hasattr(self, "_env_centroids"):
+                    env_ids = self._assign_envs_for_batch(x)
+                else:
+                    env_ids = None
 
                 self.optimizer.zero_grad()
-                losses = self.model.compute_loss(x, env_ids)
-                losses["loss"].backward()
+                out = self.model.compute_loss(x, clss, env_ids=env_ids)
+                out["loss"].backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
 
-                for k in agg:
-                    agg[k] += losses[k].item()
+                for k in ("loss", "L_sta", "L_reg", "L_inv", "rho", "mask_mean"):
+                    v = out[k]
+                    agg[k] += float(v.item() if torch.is_tensor(v) else v)
                 n += 1
 
             avg = {k: v / max(n, 1) for k, v in agg.items()}
-            print(f"epoch {epoch+1:3d}  loss={avg['loss']:.4f}  "
-                  f"recon={avg['recon']:.4f}  inv={avg['inv']:.4f}  div={avg['div']:.4f}")
+            print(
+                f"epoch {epoch+1:3d}  "
+                f"loss={avg['loss']:.4f}  "
+                f"L_sta={avg['L_sta']:.4f}  "
+                f"L_inv={avg['L_inv']:.4f}  "
+                f"L_reg={avg['L_reg']:.4f}  "
+                f"rho={avg['rho']:.3f}  "
+                f"mask_mean={avg['mask_mean']:.3f}"
+            )
 
             if avg["loss"] < best:
                 best = avg["loss"]
                 ckpt = os.path.join(self.out_dir, "dual_encoder_best.ckpt")
-                torch.save({"epoch": epoch, "model": self.model.state_dict(),
-                            "loss": best}, ckpt)
+                torch.save({
+                    "epoch": epoch,
+                    "model": self.model.state_dict(),
+                    "loss":  best,
+                    "env_centroids": getattr(self, "_env_centroids", None),
+                }, ckpt)
                 print(f"  -> saved {ckpt}")
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",  type=str, required=True)

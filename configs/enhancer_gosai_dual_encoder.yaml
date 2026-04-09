@@ -15,6 +15,7 @@ model:
   num_cnn_stacks: 5
   dropout: 0.1
   cls_free_guidance: False
+  clean_data: False
 
 dataset:
   name: gosai
@@ -30,13 +31,28 @@ loader:
   num_workers: 4
   pin_memory: True
 
-# ---------- dual encoder (semantic / variation) ----------
+# ---------- GIL-style separator ----------
+# L = L_sta  +  lambda_reg * L_reg  +  beta_inv * L_inv
+#
+#   L_sta : x_st alone must predict y
+#   L_reg : mask ratio close to rho, bimodal distribution
+#   L_inv : V-REx variance across K-means-inferred envs on x_en
+#
+# Alternating optimisation:
+#   - warmup_epochs : no env inference yet (pure ERM on x_st)
+#   - every env_infer_every epochs, run K-means on x_en embeddings to refresh
+#     the env centroids, then assign env ids per batch during the update pass
 dual_encoder:
-  num_envs: 3        # hepg2 / k562 / sknsh
-  sem_dim: 64
-  var_dim: 64
-  lambda_inv: 1.0    # L_inv(s) weight  -- semantic invariance
-  lambda_div: 1.0    # L_div(v) weight  -- variation diversification
+  target_idx: null          # null -> regress on mean(hepg2, k562, sknsh)
+                            # set 0 / 1 / 2 for a single cell line target
+  beta_inv:     1.0         # V-REx penalty weight
+  lambda_reg:   1.0         # mask regularisation weight
+  init_rho:     0.3         # initial learnable stable ratio
+  num_envs:     3           # K for K-means env inference
+  warmup_epochs: 1          # epochs with L_inv disabled
+  env_infer_every: 1        # re-run K-means every N epochs
+  kmeans_iters: 20
+  kmeans_samples: 8192      # cap on samples used for K-means fit per epoch
 
 train:
   num_epochs: 20
