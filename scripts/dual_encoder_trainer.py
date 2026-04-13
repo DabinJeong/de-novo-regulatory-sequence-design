@@ -1,5 +1,5 @@
 """
-Trainer for the GIL-style separator (see sequence_generation/model/dual_encoder.py).
+Trainer for the GIL-style separator (see sequence_generation/model/masked_separator.py).
 
 Usage:
     python -m scripts.dual_encoder_trainer \
@@ -38,7 +38,7 @@ from tqdm import tqdm
 from ml_collections.config_dict import ConfigDict
 
 from sequence_generation.utils.train_utils import load_dataloader, load_seed
-from sequence_generation.model.dual_encoder import DualEncoderModel
+from sequence_generation.model.masked_separator import MaskedSeparatorModel
 
 
 # ---------------------------------------------------------------------------
@@ -89,9 +89,9 @@ class DualEncoderTrainer:
         load_seed(config.seed)
         self.train_loader, self.eval_loader, _ = load_dataloader(config)
 
-        self.model = DualEncoderModel(config).to(self.device)
+        self.model = MaskedSeparatorModel(config).to(self.device)
 
-        de_cfg = config.get("dual_encoder", {})
+        de_cfg = config.get("masked_separator", config.get("dual_encoder", {}))
         self.num_envs       = de_cfg.get("num_envs", 3)
         self.warmup_epochs  = de_cfg.get("warmup_epochs", 1)
         self.env_infer_every = de_cfg.get("env_infer_every", 1)   # epochs

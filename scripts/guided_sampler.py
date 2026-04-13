@@ -23,7 +23,7 @@ At inference we:
     grad_y_st    = d/dxt  y_head(x_st, t)
     grad_en_push = d/dxt  min_k || embed_en(x_en, t) - centroid_k ||^2
 
-`env_centroids` are loaded from the dual-encoder checkpoint (the trainer
+`env_centroids` are loaded from the masked-separator checkpoint (the trainer
 saves them alongside the model weights after the final K-means run).
 
 The backbone weights are NOT updated. All steering happens at solve time.
@@ -43,7 +43,7 @@ from sequence_generation.utils.flow_utils import (
 )
 from sequence_generation.utils.train_utils import load_generator, load_dataloader
 from sequence_generation.model.ensemble_regressor import EnsembleRegressor
-from sequence_generation.model.dual_encoder import DualEncoderModel
+from sequence_generation.model.masked_separator import MaskedSeparatorModel
 
 
 INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
@@ -93,13 +93,13 @@ class GuidedSampler:
             p.requires_grad_(False)
 
         # ---- GIL-style separator ------------------------------------------
-        self.dual_encoder = DualEncoderModel(config)
-        de_cfg = config.get("dual_encoder", {})
+        self.separator_model = MaskedSeparatorModel(config)
+        de_cfg = config.get("masked_separator", config.get("dual_encoder", {}))
         de_ckpt = de_cfg.get("checkpoint_path", None)
         if de_ckpt and os.path.exists(de_ckpt):
             ckpt = torch.load(de_ckpt, map_location="cpu")
-            self.dual_encoder.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
-            print(f"[GuidedSampler] loaded dual-encoder checkpoint from {de_ckpt}")
+            self.separator_model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
+            print(f"[GuidedSampler] loaded masked-separator checkpoint from {de_ckpt}")
             # Try to load env centroids saved by the trainer
             env_centroids = ckpt.get("env_centroids", None) if isinstance(ckpt, dict) else None
         else:
@@ -107,8 +107,8 @@ class GuidedSampler:
                 f"Dual-encoder checkpoint required but not found at {de_ckpt}. "
                 "Train with `scripts.dual_encoder_trainer` first."
             )
-        self.dual_encoder.to(self.device).eval()
-        for p in self.dual_encoder.parameters():
+        self.separator_model.to(self.device).eval()
+        for p in self.separator_model.parameters():
             p.requires_grad_(False)
 
         # ---- guidance hyper-parameters ------------------------------------
@@ -128,7 +128,7 @@ class GuidedSampler:
         if env_centroids is not None:
             self.env_centroids = env_centroids.to(self.device)
             print(f"[GuidedSampler] loaded {self.env_centroids.size(0)} env centroids "
-                  f"from dual-encoder checkpoint (dim={self.env_centroids.size(-1)})")
+                  f"from masked-separator checkpoint (dim={self.env_centroids.size(-1)})")
         else:
             print("[GuidedSampler] no env_centroids in checkpoint; recomputing "
                   "from training data (single-centroid fallback).")
@@ -149,8 +149,8 @@ class GuidedSampler:
             x = batch["seqs"].to(self.device)
             B = x.size(0)
             t = torch.full((B,), alpha_max, device=self.device)
-            _, _, x_en = self.dual_encoder.separate(x, t=t, soft_input=False)
-            h_en = self.dual_encoder.embed_en(x_en, t)        # (B, H)
+            _, _, x_en = self.separator_model.separate(x, t=t, soft_input=False)
+            h_en = self.separator_model.embed_en(x_en, t)        # (B, H)
             feats.append(h_en)
             collected += B
             if collected >= n_samples:
@@ -210,19 +210,19 @@ class GuidedSampler:
         """
         x = xt.detach().clone().requires_grad_(True)
 
-        M = self.dual_encoder.separator(x, t_batch)              # (B, L)
+        M = self.separator_model.separator(x, t_batch)              # (B, L)
         M3 = M.unsqueeze(-1)
         x_st = x * M3
         x_en = x * (1.0 - M3)
 
         # (1) stable-sufficiency
-        y_st = self.dual_encoder.predict_y_from_st(x_st, t_batch)  # (B, 1)
+        y_st = self.separator_model.predict_y_from_st(x_st, t_batch)  # (B, 1)
         grad_stable = torch.autograd.grad(
             y_st.sum(), x, retain_graph=True,
         )[0]
 
         # (2) env push: distance to NEAREST env centroid
-        h_en = self.dual_encoder.embed_en(x_en, t_batch)           # (B, H)
+        h_en = self.separator_model.embed_en(x_en, t_batch)           # (B, H)
         #   (B, H) vs (K, H)  ->  (B, K) squared distances
         d2 = torch.cdist(h_en, self.env_centroids, p=2) ** 2       # (B, K)
         nearest = d2.min(dim=-1).values                            # (B,)

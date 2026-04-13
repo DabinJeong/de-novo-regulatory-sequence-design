@@ -1,5 +1,5 @@
 """
-GIL-style stable / environmental separator for MPRA sequences.
+GIL-style masked sub-sequence separator for MPRA sequences.
 
 Adapted from:
     Li et al., "Learning Invariant Graph Representations for Out-of-Distribution
@@ -165,11 +165,11 @@ def v_rex_penalty(
 
 
 # ---------------------------------------------------------------------------
-# Full model: separator + y-head + V-REx invariance
+# Full model: mask separator + y-head + V-REx invariance
 # ---------------------------------------------------------------------------
-class DualEncoderModel(nn.Module):
+class MaskedSeparatorModel(nn.Module):
     """
-    GIL-style separator for MPRA sequences.
+    GIL-style masked sub-sequence separator for MPRA sequences.
 
     Forward flow per training step (see `compute_loss`):
         1. sample a noisy simplex x_noisy from the clean sequence x_clean
@@ -192,7 +192,7 @@ class DualEncoderModel(nn.Module):
         self.seq_len       = config.dataset.seq_length
         self.alpha_max     = args.alpha_max
 
-        de_cfg = config.get("dual_encoder", {})
+        de_cfg = config.get("masked_separator", config.get("dual_encoder", {}))
         self.beta_inv    = de_cfg.get("beta_inv", 1.0)       # V-REx weight
         self.lambda_reg  = de_cfg.get("lambda_reg", 1.0)
         self.num_envs    = de_cfg.get("num_envs", 3)         # K for K-means
