@@ -68,6 +68,17 @@ eval:
   generate_samples: True
   subset_size: 5000
 
+masked_separator:
+  target_idx: null          # null -> regress on mean(hepg2, k562, sknsh)
+  beta_inv: 1.0             # V-REx penalty weight
+  lambda_reg: 1.0           # mask regularisation weight
+  init_rho: 0.3             # initial learnable stable ratio
+  num_envs: 3               # K for K-means env inference
+  warmup_epochs: 1          # epochs with L_inv disabled
+  env_infer_every: 1        # re-run K-means every N epochs
+  kmeans_iters: 20
+  kmeans_samples: 8192
+
 optim:
   weight_decay: 0
   lr: 0.00001
