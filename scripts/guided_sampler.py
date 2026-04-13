@@ -104,8 +104,8 @@ class GuidedSampler:
             env_centroids = ckpt.get("env_centroids", None) if isinstance(ckpt, dict) else None
         else:
             raise FileNotFoundError(
-                f"Dual-encoder checkpoint required but not found at {de_ckpt}. "
-                "Train with `scripts.dual_encoder_trainer` first."
+                f"Masked-separator checkpoint required but not found at {de_ckpt}. "
+                "Train with `scripts.masked_separator_trainer` first."
             )
         self.separator_model.to(self.device).eval()
         for p in self.separator_model.parameters():

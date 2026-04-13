@@ -2,9 +2,9 @@
 Trainer for the GIL-style separator (see sequence_generation/model/masked_separator.py).
 
 Usage:
-    python -m scripts.dual_encoder_trainer \
-        --config configs/enhancer_gosai_dual_encoder.yaml \
-        --out_dir ./runs/dual_encoder
+    python -m scripts.masked_separator_trainer \
+        --config configs/enhancer_gosai_masked_separator.yaml \
+        --out_dir ./runs/masked_separator
 
 Alternating optimisation (GIL §3)
 ---------------------------------
@@ -104,7 +104,7 @@ class DualEncoderTrainer:
             weight_decay=config.optim.get("weight_decay", 0.0),
         )
 
-        self.out_dir = config.get("out_dir", "./runs/dual_encoder")
+        self.out_dir = config.get("out_dir", "./runs/masked_separator")
         os.makedirs(self.out_dir, exist_ok=True)
 
         # Frozen snapshot of the model used for env inference and per-batch
@@ -240,7 +240,7 @@ class DualEncoderTrainer:
 
             if avg["loss"] < best:
                 best = avg["loss"]
-                ckpt = os.path.join(self.out_dir, "dual_encoder_best.ckpt")
+                ckpt = os.path.join(self.out_dir, "masked_separator_best.ckpt")
                 torch.save({
                     "epoch": epoch,
                     "model": self.model.state_dict(),
