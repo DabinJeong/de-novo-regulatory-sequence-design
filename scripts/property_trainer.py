@@ -1,5 +1,5 @@
 """
-Joint property predictor + dual encoder trainer.
+Joint property predictor + masked separator trainer.
 
 Trains a MaskedSeparatorModel (mask separator + y_head) so that:
   - y_head predicts activity from the invariant sub-sequence x_st
@@ -30,7 +30,7 @@ from sequence_generation.model.masked_separator import MaskedSeparatorModel
 
 
 # ---------------------------------------------------------------------------
-# K-means (same as dual_encoder_trainer.py)
+# K-means (same as masked_separator_trainer.py)
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def kmeans_fit_predict(
