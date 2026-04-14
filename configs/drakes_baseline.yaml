@@ -1,0 +1,55 @@
+name: drakes_baseline
+seed: 42
+
+# ---------------------------------------------------------------------------
+# Baseline: DRAKES (Wang et al., ICLR 2025)
+# https://github.com/ChenyuWang-Monica/DRAKES
+#
+# This config drives `scripts/run_drakes_baseline.py`, a thin wrapper that
+# loads the DRAKES fine-tuned masked discrete diffusion model, generates
+# enhancer sequences with DRAKES' `_sample()` API, and scores them with
+# **our** ensemble regressor so the evaluation is apples-to-apples with our
+# guided sampler's `seq,mu,sigma,score` CSV output.
+# ---------------------------------------------------------------------------
+
+drakes:
+  # Absolute path to a checkout of https://github.com/ChenyuWang-Monica/DRAKES
+  repo_path: /path/to/DRAKES
+
+  # BASE_PATH from DRAKES' README — directory holding their Dropbox-distributed
+  # data + checkpoints (mdlm/outputs_gosai/..., mdlm/reward_bp_results_final/...).
+  base_path: /path/to/DRAKES_data
+
+  # Relative paths inside drakes/drakes_dna/configs_gosai for Hydra composition.
+  hydra_config_dir: configs_gosai
+  hydra_config_name: config_gosai.yaml
+
+  # Which DRAKES checkpoint to evaluate.
+  #   "finetuned"   : reward-backprop fine-tuned model (main DRAKES result)
+  #   "pretrained"  : MDLM pretrained generator (unconditional, no reward)
+  #   "zero_alpha"  : reward-only fine-tuning without KL (DRAKES ablation)
+  #   "cfg"         : classifier-free guidance variant
+  checkpoint_kind: finetuned
+
+  # Override the specific checkpoint filepath (absolute). If null, derived from
+  # checkpoint_kind under base_path/mdlm/.../*.ckpt.
+  checkpoint_path: null
+
+# ---------------------------------------------------------------------------
+# Our ensemble regressor for scoring (mu, sigma) — same model used by
+# scripts/guided_sampler.py, so the comparison is fair.
+# ---------------------------------------------------------------------------
+ensemble:
+  checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
+  num_members: 5
+  hidden_dim:  128
+  depth:       4
+  dropout:     0.1
+
+model:
+  alphabet_size: 4          # A,C,G,T — matches DRAKES and our pipeline
+
+sampling:
+  num_batches: 10
+  batch_size:  64
+  gamma_rank:  1.0          # score = mu - gamma_rank * sigma
