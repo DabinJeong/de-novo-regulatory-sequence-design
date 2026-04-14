@@ -1,4 +1,4 @@
-from scripts.property_trainer import Trainer
+from scripts.masked_separator_trainer import DualEncoderTrainer
 from scripts.sampler import Sampler
 
 import argparse
@@ -23,7 +23,7 @@ if __name__ == "__main__":
 
     if args.train:
         # Initialize Trainer
-        trainer = Trainer(config)
+        trainer = DualEncoderTrainer(config)
 
         # Start training
         trainer.train()
