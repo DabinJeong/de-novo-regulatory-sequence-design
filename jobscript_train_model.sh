@@ -3,7 +3,7 @@
 #BSUB -L /usr/bin/bash
 #BSUB -o train-sequence_generation.%J.out
 #BSUB -e train-sequence_generation.%J.err
-#BSUB -q gpu-lotfollahi-train
+#BSUB -q training-parallel
 #BSUB -gpu "mode=shared:j_exclusive=no:gmem=76GB:num=1"
 #BSUB -n 16
 #BSUB -M 40GB
@@ -27,7 +27,7 @@ ENV_PATH="/nfs/team361/dj16/pypoetry/virtualenvs/sequence-generation-7Ds7Y9Ey-py
 
 # === Training ===
 # Without DDP
-python -u -m scripts.main --train --config ${run_dir}/configs/enhancer_gosai.yaml --out_dir ${output_dir}/sequence_generation_${LSB_JOBID}
+python -u -m scripts.main --train --config ${run_dir}/configs/enhancer_gosai_masked_separator.yaml --out_dir ${output_dir}/sequence_generation_${LSB_JOBID}
 
 # With DDP
 # torchrun --standalone --nproc_per_node 2 -m scripts.main --train --config ${run_dir}/configs/enhancer_gosai.yaml --out_dir ${output_dir}/sequence_generation_${LSB_JOBID}
