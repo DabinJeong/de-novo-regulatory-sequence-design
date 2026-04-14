@@ -22,6 +22,7 @@ dataset:
   data_path: /lustre/scratch126/cellgen/lotfollahi/dj16/data/sequence_data/enhancer_gosai_DRAKES/processed_data/gosai_all.csv
   seq_length: 200
   streaming: False
+  train_size: 50000
 
 loader:
   global_batch_size: 64
