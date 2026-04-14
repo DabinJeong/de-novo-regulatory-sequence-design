@@ -28,6 +28,9 @@ Training objective
     L_reg : mask ratio close to learnable rho, bimodal   (non-triviality)
     L_inv : V-REx variance across inferred environments  (invariance)
 
+This module is a standalone V-REx model operating on clean one-hot
+sequences. It is independent of the Dirichlet-FM generative backbone
+and has no time conditioning or expanded-simplex input.
 Modules (1) and (3) live in this file. Module (2) — K-means env inference —
 lives in the trainer because it needs a batch-global view and is alternated
 with separator updates (standard GIL alternating optimisation).
@@ -38,35 +41,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sequence_generation.model.denoising_classifier import CNNModel
-
 
 # ---------------------------------------------------------------------------
 # Shared CNN backbone producing per-position features (B, hidden, L)
 # ---------------------------------------------------------------------------
 class _CNNBackbone(nn.Module):
-    """Wraps CNNModel so we can get per-position features before pooling."""
+    """
+    Plain 1D CNN backbone (no time conditioning, no expanded simplex).
+    Input:  (B, L, K) soft simplex or one-hot
+    Output: (B, hidden, L) per-position features
+    """
 
     def __init__(self, args, alphabet_size: int):
         super().__init__()
-        self._cnn = CNNModel(args, alphabet_size, num_cls=1, classifier=False)
+        hidden = args.hidden_dim
+        dropout = getattr(args, "dropout", 0.1)
+        num_layers = 5 * getattr(args, "num_cnn_stacks", 1)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, L, K) soft simplex (one-hot is a valid special case)
-        t: (B,)      Dirichlet time
-        returns: (B, hidden, L)
-        """
-        cnn = self._cnn
-        time_emb = F.relu(cnn.time_embedder(t))
-        feat = F.relu(cnn.linear(x.permute(0, 2, 1)))        # (B, hidden, L)
-        for i in range(cnn.num_layers):
-            h = cnn.dropout(feat.clone())
-            h = h + cnn.time_layers[i](time_emb)[:, :, None]
-            h = cnn.norms[i](h.permute(0, 2, 1))
-            h = F.relu(cnn.convs[i](h.permute(0, 2, 1)))
+        self.in_conv = nn.Conv1d(alphabet_size, hidden, kernel_size=9, padding=4)
+
+        dilations = [1, 1, 4, 16, 64]
+        paddings  = [4, 4, 16, 64, 256]
+        stacks = getattr(args, "num_cnn_stacks", 1)
+        convs = []
+        for _ in range(stacks):
+            for d, p in zip(dilations, paddings):
+                convs.append(nn.Conv1d(hidden, hidden, kernel_size=9,
+                                       dilation=d, padding=p))
+        self.convs = nn.ModuleList(convs)
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(num_layers)])
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = F.relu(self.in_conv(x.permute(0, 2, 1)))        # (B, H, L)
+        for conv, norm in zip(self.convs, self.norms):
+            h = self.dropout(feat.clone())
+            h = norm(h.permute(0, 2, 1)).permute(0, 2, 1)
+            h = F.relu(conv(h))
             feat = h + feat if h.shape == feat.shape else h
-        return feat                                           # (B, hidden, L)
+        return feat                                           # (B, H, L)
 
 
 # ---------------------------------------------------------------------------
@@ -88,8 +101,8 @@ class StableMaskSeparator(nn.Module):
             nn.Linear(hidden, 1),
         )
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        feat = self.backbone(x, t)                           # (B, H, L)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.backbone(x)                              # (B, H, L)
         feat = feat.permute(0, 2, 1)                         # (B, L, H)
         logits = self.mask_head(feat).squeeze(-1)            # (B, L)
         return torch.sigmoid(logits)                         # (B, L)
@@ -111,8 +124,8 @@ class YHead(nn.Module):
             nn.Linear(hidden, out_dim),
         )
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        feat = self.backbone(x, t)                           # (B, H, L)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.backbone(x)                              # (B, H, L)
         pooled = self.pool(feat).squeeze(-1)                 # (B, H)
         return self.readout(pooled)                          # (B, out_dim)
 
@@ -172,10 +185,10 @@ class MaskedSeparatorModel(nn.Module):
     GIL-style masked sub-sequence separator for MPRA sequences.
 
     Forward flow per training step (see `compute_loss`):
-        1. sample a noisy simplex x_noisy from the clean sequence x_clean
-        2. predict mask M = separator(x_noisy, t)
-        3. build x_st = x_noisy * M,  x_en = x_noisy * (1 - M)
-        4. per_sample = (y_head(x_st, t) - y)^2   -- element-wise MSE
+        1. embed clean one-hot x
+        2. predict mask M = separator(x)
+        3. build x_st = x * M,  x_en = x * (1 - M)
+        4. per_sample = (y_head(x_st) - y)^2   -- element-wise MSE
         5. L_sta = mean(per_sample)
         6. L_inv = v_rex_penalty(per_sample, env_ids)   (if env_ids given)
         7. L_reg = mask_regularisation(M, rho)
@@ -190,7 +203,6 @@ class MaskedSeparatorModel(nn.Module):
         args = config.model
         self.alphabet_size = args.alphabet_size
         self.seq_len       = config.dataset.seq_length
-        self.alpha_max     = args.alpha_max
 
         de_cfg = config.get("masked_separator", config.get("dual_encoder", {}))
         self.beta_inv    = de_cfg.get("beta_inv", 1.0)       # V-REx weight
@@ -218,14 +230,8 @@ class MaskedSeparatorModel(nn.Module):
         return y
 
     # ------------------------------------------------------------------
-    def _sample_noisy(self, x_clean: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Dirichlet-FM style noisy simplex around clean one-hot."""
-        B, L = x_clean.shape
-        K = self.alphabet_size
-        x_onehot = F.one_hot(x_clean, K).float()
-        alphas_ = torch.ones(B, L, K, device=x_clean.device) \
-                  + x_onehot * (t[:, None, None] - 1)
-        return torch.distributions.Dirichlet(alphas_).sample()
+    def _one_hot(self, x_clean: torch.Tensor) -> torch.Tensor:
+        return F.one_hot(x_clean, self.alphabet_size).float()
 
     # ------------------------------------------------------------------
     def compute_loss(
@@ -233,28 +239,23 @@ class MaskedSeparatorModel(nn.Module):
         x_clean: torch.Tensor,              # (B, L) token ids
         clss: torch.Tensor,                 # (B, num_tasks)
         env_ids: Optional[torch.Tensor] = None,   # (B,) inferred env ids
-        t: Optional[torch.Tensor] = None,
     ) -> dict:
-        B, L = x_clean.shape
         device = x_clean.device
 
-        if t is None:
-            t = 1.0 + torch.rand(B, device=device) * (self.alpha_max - 1.0)
-
-        # 1. noisy simplex input
-        x_noisy = self._sample_noisy(x_clean, t)             # (B, L, K)
+        # 1. clean one-hot input
+        x = self._one_hot(x_clean)                           # (B, L, K)
 
         # 2. separator produces mask
-        M = self.separator(x_noisy, t)                       # (B, L)
+        M = self.separator(x)                                # (B, L)
         M3 = M.unsqueeze(-1)                                 # (B, L, 1)
 
-        # 3. stable / environmental sub-sequences (still on the simplex)
-        x_st = x_noisy * M3
-        x_en = x_noisy * (1.0 - M3)
+        # 3. stable / environmental sub-sequences
+        x_st = x * M3
+        x_en = x * (1.0 - M3)
 
         # 4. per-sample squared error on x_st
         y = self._target(clss)                               # (B, 1)
-        y_hat_st = self.y_head(x_st, t)                      # (B, 1)
+        y_hat_st = self.y_head(x_st)                         # (B, 1)
         per_sample = ((y_hat_st - y) ** 2).squeeze(-1)       # (B,)
 
         # 5. L_sta = average MSE  (the "ERM" term inside V-REx)
@@ -283,7 +284,6 @@ class MaskedSeparatorModel(nn.Module):
             "M":    M.detach(),
             "x_st": x_st.detach(),
             "x_en": x_en.detach(),
-            "t":    t.detach(),
         }
 
     # ------------------------------------------------------------------
@@ -291,7 +291,6 @@ class MaskedSeparatorModel(nn.Module):
     def separate(
         self,
         x: torch.Tensor,
-        t: Optional[torch.Tensor] = None,
         soft_input: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -299,44 +298,27 @@ class MaskedSeparatorModel(nn.Module):
 
         x           : (B, L) token ids  if soft_input is False
                       (B, L, K) simplex  if soft_input is True
-        t           : (B,) Dirichlet time, defaults to alpha_max (clean end)
         soft_input  : format flag for x
         """
-        if soft_input:
-            x_soft = x
-            B = x_soft.size(0)
-        else:
-            B = x.size(0)
-            x_soft = F.one_hot(x, self.alphabet_size).float()
+        x_soft = x if soft_input else self._one_hot(x)
 
-        if t is None:
-            t = torch.full((B,), float(self.alpha_max), device=x_soft.device)
-
-        M = self.separator(x_soft, t)                        # (B, L)
+        M = self.separator(x_soft)                           # (B, L)
         M3 = M.unsqueeze(-1)
         x_st = x_soft * M3
         x_en = x_soft * (1.0 - M3)
         return M, x_st, x_en
 
     # ------------------------------------------------------------------
-    def predict_y_from_st(
-        self,
-        x_st: torch.Tensor,
-        t: torch.Tensor,
-    ) -> torch.Tensor:
+    def predict_y_from_st(self, x_st: torch.Tensor) -> torch.Tensor:
         """Differentiable y prediction from stable sub-sequence (used by sampler)."""
-        return self.y_head(x_st, t)
+        return self.y_head(x_st)
 
     # ------------------------------------------------------------------
-    def embed_en(
-        self,
-        x_en: torch.Tensor,
-        t: torch.Tensor,
-    ) -> torch.Tensor:
+    def embed_en(self, x_en: torch.Tensor) -> torch.Tensor:
         """
         Pooled representation of x_en using the y-head's backbone.
         Used by (i) K-means env inference in the trainer,
                 (ii) variation-push guidance in the sampler.
         """
-        feat = self.y_head.backbone(x_en, t)                 # (B, H, L)
+        feat = self.y_head.backbone(x_en)                    # (B, H, L)
         return feat.mean(dim=-1)                             # (B, H)
