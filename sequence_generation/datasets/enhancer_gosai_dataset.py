@@ -30,10 +30,20 @@ def get_dataloaders_gosai(config, skip_valid=False, valid_seed=42):
         raise ValueError(
            f'Eval Batch Size for {config.eval.batch_size} '
            f'not divisible by {num_gpus}.')
-    train_set = GosaiDataset(config.dataset.data_path)
-    # randomly sample a subset of the train_set as valid_set
-    valid_set = torch.utils.data.Subset(train_set, np.random.choice(len(train_set), 40000, replace=False))
-    test_set = torch.utils.data.Subset(train_set, np.random.choice(len(train_set), 40000, replace=False))
+    full_set = GosaiDataset(config.dataset.data_path)
+    # randomly sample a subset of the full set as valid/test (unchanged behavior)
+    valid_set = torch.utils.data.Subset(full_set, np.random.choice(len(full_set), 40000, replace=False))
+    test_set = torch.utils.data.Subset(full_set, np.random.choice(len(full_set), 40000, replace=False))
+    # Optional: subsample the training set for faster epochs.
+    train_size = config.dataset.get("train_size", None)
+    if train_size is not None and train_size < len(full_set):
+        rng = np.random.RandomState(config.get("seed", 42))
+        idx = rng.choice(len(full_set), int(train_size), replace=False)
+        train_set = torch.utils.data.Subset(full_set, idx)
+        print(f"[gosai] subsampled train set to {len(train_set)} examples "
+              f"(full={len(full_set)})")
+    else:
+        train_set = full_set
 
     train_loader = torch.utils.data.DataLoader(train_set,
                                                batch_size=config.loader.batch_size,
