@@ -147,14 +147,12 @@ class DualEncoderTrainer:
             p.requires_grad_(False)
 
         feats = []
-        alpha_max = float(self.config.model.alpha_max)
         collected = 0
         for batch in tqdm(self.train_loader, desc=f"epoch {epoch+1} [infer envs]"):
             x = batch["seqs"].to(self.device)
             B = x.size(0)
-            t = torch.full((B,), alpha_max, device=self.device)
-            _, _, x_en = self._env_model.separate(x, t=t, soft_input=False)
-            h_en = self._env_model.embed_en(x_en, t)         # (B, H)
+            _, _, x_en = self._env_model.separate(x, soft_input=False)
+            h_en = self._env_model.embed_en(x_en)            # (B, H)
             feats.append(h_en)
             collected += B
             if collected >= self.kmeans_samples:
@@ -179,13 +177,10 @@ class DualEncoderTrainer:
     @torch.no_grad()
     def _assign_envs_for_batch(self, x: torch.Tensor) -> torch.Tensor:
         """Assign env id to each sample in the current batch using cached centroids."""
-        B = x.size(0)
-        alpha_max = float(self.config.model.alpha_max)
-        t = torch.full((B,), alpha_max, device=self.device)
         # Use the frozen snapshot so env ids stay consistent with the
         # centroids that were fit at the start of this epoch.
-        _, _, x_en = self._env_model.separate(x, t=t, soft_input=False)
-        h_en = self._env_model.embed_en(x_en, t)             # (B, H)
+        _, _, x_en = self._env_model.separate(x, soft_input=False)
+        h_en = self._env_model.embed_en(x_en)                # (B, H)
         d2 = torch.cdist(h_en, self._env_centroids, p=2) ** 2
         return d2.argmin(dim=-1)                             # (B,)
 

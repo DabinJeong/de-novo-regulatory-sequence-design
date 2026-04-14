@@ -144,13 +144,11 @@ class GuidedSampler:
         train_loader, _, _ = load_dataloader(self.config)
         collected = 0
         feats = []
-        alpha_max = float(self.config.model.alpha_max)
         for batch in train_loader:
             x = batch["seqs"].to(self.device)
             B = x.size(0)
-            t = torch.full((B,), alpha_max, device=self.device)
-            _, _, x_en = self.separator_model.separate(x, t=t, soft_input=False)
-            h_en = self.separator_model.embed_en(x_en, t)        # (B, H)
+            _, _, x_en = self.separator_model.separate(x, soft_input=False)
+            h_en = self.separator_model.embed_en(x_en)           # (B, H)
             feats.append(h_en)
             collected += B
             if collected >= n_samples:
@@ -200,29 +198,29 @@ class GuidedSampler:
     # ----------------------------------------------------------------------
     # GIL separator gradients (stable-sufficiency + env-push)
     # ----------------------------------------------------------------------
-    def _gil_grads(self, xt: torch.Tensor, t_batch: torch.Tensor):
+    def _gil_grads(self, xt: torch.Tensor):
         """
         Returns (grad_stable, grad_en_push), each (B, L, K).
 
-        grad_stable  : direction increasing y_head(x_st, t)
-        grad_en_push : direction increasing the min-distance from h_en(x_en, t)
+        grad_stable  : direction increasing y_head(x_st)
+        grad_en_push : direction increasing the min-distance from h_en(x_en)
                        to the set of training env centroids
         """
         x = xt.detach().clone().requires_grad_(True)
 
-        M = self.separator_model.separator(x, t_batch)              # (B, L)
+        M = self.separator_model.separator(x)                       # (B, L)
         M3 = M.unsqueeze(-1)
         x_st = x * M3
         x_en = x * (1.0 - M3)
 
         # (1) stable-sufficiency
-        y_st = self.separator_model.predict_y_from_st(x_st, t_batch)  # (B, 1)
+        y_st = self.separator_model.predict_y_from_st(x_st)         # (B, 1)
         grad_stable = torch.autograd.grad(
             y_st.sum(), x, retain_graph=True,
         )[0]
 
         # (2) env push: distance to NEAREST env centroid
-        h_en = self.separator_model.embed_en(x_en, t_batch)           # (B, H)
+        h_en = self.separator_model.embed_en(x_en)                  # (B, H)
         #   (B, H) vs (K, H)  ->  (B, K) squared distances
         d2 = torch.cdist(h_en, self.env_centroids, p=2) ** 2       # (B, K)
         nearest = d2.min(dim=-1).values                            # (B,)
@@ -269,8 +267,7 @@ class GuidedSampler:
             grad_mu, grad_var, _, _ = self._mu_sigma2_grads(xt)
 
             # ---- GIL separator guidance -----------------------------------
-            t_batch = s[None].expand(B)
-            grad_stable, grad_en_push = self._gil_grads(xt, t_batch)
+            grad_stable, grad_en_push = self._gil_grads(xt)
 
             u_star = (
                 u_t
