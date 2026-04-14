@@ -1,0 +1,52 @@
+name: dna_diffusion_baseline
+seed: 42
+
+# ---------------------------------------------------------------------------
+# Baseline: DNA-Diffusion (Lal et al., Nature Genetics 2025)
+# https://github.com/pinellolab/DNA-Diffusion
+#
+# Cell-type-conditional score-based diffusion for 200bp regulatory elements.
+# This config drives `scripts/run_dna_diffusion_baseline.py`, which loads a
+# DNA-Diffusion checkpoint, samples sequences for specified cell types, and
+# scores each with our EnsembleRegressor so the CSV matches the
+# seq/mu/sigma/score format emitted by scripts/guided_sampler.py.
+# ---------------------------------------------------------------------------
+
+dna_diffusion:
+  # Absolute path to a checkout of https://github.com/pinellolab/DNA-Diffusion
+  repo_path: /path/to/DNA-Diffusion
+
+  # Hydra config inside <repo_path>/configs; sample.yaml composes model / data /
+  # diffusion / sampling defaults.
+  hydra_config_dir: configs
+  hydra_config_name: sample.yaml
+
+  # Path to the model checkpoint. safetensors or .pt both work.
+  checkpoint_path: /path/to/DNA-Diffusion/checkpoints/model.safetensors
+
+  # Which cell types to sample for. Integer tokens map to the dataset's
+  # numeric_to_tag_dict; leave null to sample all cell types in the dataset.
+  cell_types: null
+
+  # Classifier-free guidance weight (DNA-Diffusion param; 1.0 = conditional
+  # without extra guidance, >1.0 strengthens conditioning).
+  guidance_scale: 1.0
+
+# ---------------------------------------------------------------------------
+# Our ensemble regressor for scoring (mu, sigma) — same model used by
+# scripts/guided_sampler.py so this baseline is apples-to-apples.
+# ---------------------------------------------------------------------------
+ensemble:
+  checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
+  num_members: 5
+  hidden_dim:  128
+  depth:       4
+  dropout:     0.1
+
+model:
+  alphabet_size: 4          # A,C,G,T — matches DNA-Diffusion's nucleotide order
+
+sampling:
+  number_of_samples: 640    # per cell type (DNA-Diffusion semantics)
+  sample_batch_size: 64
+  gamma_rank: 1.0           # score = mu - gamma_rank * sigma
