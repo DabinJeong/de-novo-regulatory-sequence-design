@@ -1,0 +1,67 @@
+name: svdd_baseline
+seed: 42
+
+# ---------------------------------------------------------------------------
+# Baseline: SVDD (Li, Zhao, Uehara et al., "Derivative-Free Guidance in
+# Continuous and Discrete Diffusion Models with Soft Value-Based Decoding",
+# NeurIPS 2024).  https://github.com/masa-ue/SVDD
+#
+# SVDD is a training-free, derivative-free test-time guidance method that
+# replaces gradient-based steering with Monte-Carlo / posterior-mean
+# resampling weighted by a value function. It is the DNA-enhancer analogue
+# of the RIR family we originally enumerated (ProDifEvo-Refinement), whose
+# public code is protein-only. SVDD is by the same author group, same
+# "test-time guidance over a frozen diffusion prior" philosophy, and ships
+# a ready-to-run Gosai enhancer setup via `diffusion_gosai.Diffusion`.
+#
+# This wrapper lets us run three decoding modes against a single MDLM
+# pretrained backbone:
+#   mc      : controlled_sample(...)          -- SVDD-MC
+#   tweedie : controlled_sample_tweedie(...)  -- SVDD-PM (posterior mean)
+#   plain   : _sample(...)                    -- unconditional pretrained
+# and then score outputs with **our** ensemble regressor so the evaluation
+# is apples-to-apples with scripts/guided_sampler.py (same CSV schema).
+# ---------------------------------------------------------------------------
+
+svdd:
+  # Absolute path to a checkout of https://github.com/masa-ue/SVDD
+  # (the subdirectory containing diffusion_gosai.py, oracle.py, dataloader_gosai.py,
+  #  models/, noise_schedule.py, utils.py, configs_gosai/, and the pretrained
+  #  MDLM Gosai checkpoint).
+  repo_path: /path/to/SVDD
+
+  # Hydra composition for the SVDD Gosai config (relative to repo_path).
+  hydra_config_dir: configs_gosai
+  hydra_config_name: config_gosai.yaml
+
+  # Path to the pretrained MDLM checkpoint SVDD decodes from.
+  # Required for `plain` mode and used as the frozen prior for `mc`/`tweedie`.
+  checkpoint_path: /path/to/SVDD_data/mdlm_pretrained_gosai.ckpt
+
+  # Decoding mode: "mc" (SVDD-MC), "tweedie" (SVDD-PM), or "plain" (no guidance)
+  mode: tweedie
+
+  # SVDD hyperparameters
+  sample_M: 10        # candidate width (both mc and tweedie)
+  num_steps: null     # null -> use sampling.steps from the loaded hydra config
+  options: true       # passed to controlled_sample_tweedie (SVDD-PM flag)
+  task: dna           # passed to controlled_sample_tweedie
+
+# ---------------------------------------------------------------------------
+# Our ensemble regressor for scoring (mu, sigma) — same model used by
+# scripts/guided_sampler.py, so the comparison is fair.
+# ---------------------------------------------------------------------------
+ensemble:
+  checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
+  num_members: 5
+  hidden_dim:  128
+  depth:       4
+  dropout:     0.1
+
+model:
+  alphabet_size: 4          # A,C,G,T — SVDD's vocab (mask token excluded)
+
+sampling:
+  num_batches: 10
+  batch_size:  64
+  gamma_rank:  1.0          # score = mu - gamma_rank * sigma
