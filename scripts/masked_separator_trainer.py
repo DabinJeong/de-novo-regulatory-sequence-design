@@ -81,7 +81,7 @@ def kmeans_fit_predict(
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
-class DualEncoderTrainer:
+class MaskedSeparatorTrainer:
     def __init__(self, config):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -258,7 +258,7 @@ def main():
         config = ConfigDict(yaml.safe_load(f))
     config.out_dir = args.out_dir
 
-    DualEncoderTrainer(config).train()
+    MaskedSeparatorTrainer(config).train()
 
 
 if __name__ == "__main__":
