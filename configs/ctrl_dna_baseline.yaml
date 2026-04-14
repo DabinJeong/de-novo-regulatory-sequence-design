@@ -1,0 +1,62 @@
+name: ctrl_dna_baseline
+seed: 42
+
+# ---------------------------------------------------------------------------
+# Baseline: Ctrl-DNA (Li et al., "Ctrl-DNA: Controllable Cell-Type-Specific
+# Regulatory DNA Design via Constrained RL", 2025).
+# https://github.com/xinyuli1204/Ctrl-DNA
+#
+# Ctrl-DNA fine-tunes a pretrained regLM (Lal et al., "regLM: Designing
+# Realistic Regulatory DNA with Autoregressive Language Models", 2024)
+# with REINFORCE under a Lagrangian constraint so that the sampled
+# sequences maximise on-cell-type activity while keeping off-cell-type
+# activity below a budget.
+#
+# This wrapper assumes the user has already trained a Ctrl-DNA agent for
+# a given cell type with the upstream repo's training scripts
+# (typically `reinforce_lagrange_enhancers.sh`). We then:
+#   1. load the trained regLM agent checkpoint,
+#   2. sample N sequences conditioned on a cell-type label prefix,
+#   3. score them with **our** EnsembleRegressor,
+#   4. write CSV with columns `seq, mu, sigma, score` matching our other
+#      baseline runners.
+# ---------------------------------------------------------------------------
+
+ctrl_dna:
+  # Absolute path to a checkout of https://github.com/xinyuli1204/Ctrl-DNA
+  # (contains the regLM-style Lightning agent and training scripts).
+  repo_path: /path/to/Ctrl-DNA
+
+  # Trained Ctrl-DNA agent checkpoint produced by the upstream repo's
+  # training scripts (e.g. `reinforce_lagrange_enhancers.sh`).
+  checkpoint_path: /path/to/ctrl_dna/agent_best.ckpt
+
+  # Cell-type prefix token(s) prepended to the regLM prompt at sampling
+  # time. Ctrl-DNA follows regLM's convention of using per-activity bucket
+  # tokens; use whatever label the trained agent was conditioned on.
+  cell_type_prefix: "HEPG2_HIGH"
+
+  # Temperature for nucleus sampling (regLM default is 1.0).
+  temperature: 1.0
+  top_k: 0           # 0 -> disabled
+  top_p: 1.0         # 1.0 -> disabled
+
+# ---------------------------------------------------------------------------
+# Our ensemble regressor for scoring (mu, sigma) — same model used by
+# scripts/guided_sampler.py, so the comparison is fair.
+# ---------------------------------------------------------------------------
+ensemble:
+  checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
+  num_members: 5
+  hidden_dim:  128
+  depth:       4
+  dropout:     0.1
+
+model:
+  alphabet_size: 4          # A,C,G,T
+
+sampling:
+  num_batches: 10
+  batch_size:  64
+  seq_length:  200          # Gosai enhancer length
+  gamma_rank:  1.0          # score = mu - gamma_rank * sigma
