@@ -214,6 +214,15 @@ class MaskedSeparatorModel(nn.Module):
         self.separator = StableMaskSeparator(args, self.alphabet_size)
         self.y_head    = YHead(args, self.alphabet_size, out_dim=1)
 
+        # Dedicated encoder for x_en used by K-means env inference and the
+        # sampler's env-push guidance. Kept separate from y_head.backbone so
+        # that collapsing the mask (x_st -> 0, y_head tuned for "0 -> const")
+        # does not corrupt the env embedding space. This backbone receives no
+        # gradient from L_sta; it acts as a frozen-at-init random projection
+        # on x_en, which is enough for K-means clustering but breaks the
+        # self-reinforcing mask=0 collapse loop.
+        self.en_encoder = _CNNBackbone(args, self.alphabet_size)
+
         # Learnable stable ratio (adapts during training)
         self.rho = nn.Parameter(torch.tensor(float(init_rho)))
 
@@ -316,9 +325,10 @@ class MaskedSeparatorModel(nn.Module):
     # ------------------------------------------------------------------
     def embed_en(self, x_en: torch.Tensor) -> torch.Tensor:
         """
-        Pooled representation of x_en using the y-head's backbone.
-        Used by (i) K-means env inference in the trainer,
-                (ii) variation-push guidance in the sampler.
+        Pooled representation of x_en using a dedicated env encoder that is
+        *not* shared with y_head. Used by
+            (i)  K-means env inference in the trainer,
+            (ii) variation-push guidance in the sampler.
         """
-        feat = self.y_head.backbone(x_en)                    # (B, H, L)
+        feat = self.en_encoder(x_en)                         # (B, H, L)
         return feat.mean(dim=-1)                             # (B, H)
