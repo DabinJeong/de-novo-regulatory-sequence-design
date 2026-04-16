@@ -210,8 +210,9 @@ class GuidedSampler:
 
         M = self.separator_model.separator(x)                       # (B, L)
         M3 = M.unsqueeze(-1)
-        x_st = x * M3
-        x_en = x * (1.0 - M3)
+        bkg = self.separator_model.mask_embed.view(1, 1, -1)        # (1, 1, K)
+        x_st = x * M3 + bkg * (1.0 - M3)
+        x_en = x * (1.0 - M3) + bkg * M3
 
         # (1) stable-sufficiency
         y_st = self.separator_model.predict_y_from_st(x_st)         # (B, 1)

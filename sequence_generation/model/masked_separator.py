@@ -36,6 +36,7 @@ lives in the trainer because it needs a batch-global view and is alternated
 with separator updates (standard GIL alternating optimisation).
 """
 
+import math
 from typing import Optional, Tuple
 import torch
 import torch.nn as nn
@@ -92,7 +93,7 @@ class StableMaskSeparator(nn.Module):
     M_i -> 0 : position i belongs to x_en (environmental / background)
     """
 
-    def __init__(self, args, alphabet_size: int):
+    def __init__(self, args, alphabet_size: int, init_rho: float = 0.3):
         super().__init__()
         self.backbone = _CNNBackbone(args, alphabet_size)
         hidden = args.hidden_dim
@@ -100,6 +101,13 @@ class StableMaskSeparator(nn.Module):
             nn.Linear(hidden, hidden), nn.ReLU(),
             nn.Linear(hidden, 1),
         )
+        # Initialise the output-layer bias so sigmoid(bias) = init_rho, i.e.
+        # the mask starts at the target stable ratio rather than 0.5. Keeps
+        # the system away from the bimodal-term valleys (at M=0 and M=1)
+        # that previously swallowed training in the first epoch.
+        init_rho = float(min(max(init_rho, 1e-4), 1 - 1e-4))
+        with torch.no_grad():
+            self.mask_head[-1].bias.fill_(math.log(init_rho / (1.0 - init_rho)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.backbone(x)                              # (B, H, L)
@@ -133,17 +141,29 @@ class YHead(nn.Module):
 # ---------------------------------------------------------------------------
 # Losses
 # ---------------------------------------------------------------------------
-def mask_regularisation(M: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
+def mask_regularisation(
+    M: torch.Tensor,
+    rho: torch.Tensor,
+    lambda_bimodal: float = 0.0,
+) -> torch.Tensor:
     """
     Encourages:
-      (1) average mask value close to learnable stable-ratio rho
-      (2) fraction of "active" positions (M > 0.5) close to rho (bimodality)
+      (1) average mask value tracks the target rho from both sides
+          (symmetric quadratic) — target-expected-L0 anchoring in the
+          spirit of Louizos et al. 2018 and Shazeer et al. 2017.
+      (2) optional bimodality via M*(1-M), weighted by lambda_bimodal.
+          Disabled by default because at lambda_bimodal > 0 the valleys
+          at M=0 and M=1 act as attractors: combined with the mean term
+          preferring the side of rho closer to {0,1}, the separator
+          collapses onto one of those degenerate solutions in the first
+          epoch. Turn on only after a soft mask has stabilised around
+          rho (e.g. as a second-stage annealing).
     """
     mean_term = (M.mean() - rho) ** 2
-    # Differentiable bimodality: penalise M*(1-M) so values are pushed
-    # toward {0, 1}. The previous (M > 0.5) indicator had no gradient.
-    bimodal_term = (M * (1.0 - M)).mean()
-    return mean_term + bimodal_term
+    if lambda_bimodal > 0.0:
+        bimodal_term = (M * (1.0 - M)).mean()
+        return mean_term + lambda_bimodal * bimodal_term
+    return mean_term
 
 
 def v_rex_penalty(
@@ -205,13 +225,14 @@ class MaskedSeparatorModel(nn.Module):
         self.seq_len       = config.dataset.seq_length
 
         de_cfg = config.get("masked_separator", config.get("dual_encoder", {}))
-        self.beta_inv    = de_cfg.get("beta_inv", 1.0)       # V-REx weight
-        self.lambda_reg  = de_cfg.get("lambda_reg", 1.0)
-        self.num_envs    = de_cfg.get("num_envs", 3)         # K for K-means
-        self.target_idx  = de_cfg.get("target_idx", None)    # None -> mean over tasks
-        init_rho         = de_cfg.get("init_rho", 0.3)
+        self.beta_inv       = de_cfg.get("beta_inv", 1.0)         # V-REx weight
+        self.lambda_reg     = de_cfg.get("lambda_reg", 1.0)       # overall L_reg scale
+        self.lambda_bimodal = de_cfg.get("lambda_bimodal", 0.0)   # bimodal sub-weight
+        self.num_envs       = de_cfg.get("num_envs", 3)           # K for K-means
+        self.target_idx     = de_cfg.get("target_idx", None)      # None -> mean over tasks
+        init_rho            = de_cfg.get("init_rho", 0.3)
 
-        self.separator = StableMaskSeparator(args, self.alphabet_size)
+        self.separator = StableMaskSeparator(args, self.alphabet_size, init_rho=init_rho)
         self.y_head    = YHead(args, self.alphabet_size, out_dim=1)
 
         # Dedicated encoder for x_en used by K-means env inference and the
@@ -223,8 +244,27 @@ class MaskedSeparatorModel(nn.Module):
         # self-reinforcing mask=0 collapse loop.
         self.en_encoder = _CNNBackbone(args, self.alphabet_size)
 
-        # Learnable stable ratio (adapts during training)
-        self.rho = nn.Parameter(torch.tensor(float(init_rho)))
+        # Learnable mask-token embedding: positions that get masked out are
+        # replaced with this vector rather than zeroed. Keeps the y_head's
+        # input at a constant nucleotide-scale magnitude so the degenerate
+        # "zero input -> constant output" shortcut is no longer available.
+        # This matches the BERT/MLM convention (Devlin et al. 2019) and the
+        # rationalization-literature fix for extractor-predictor collapse
+        # (Yu et al. 2019 "Rethinking Cooperative Rationalization";
+        #  Bastings et al. 2019 warn explicitly that zero-masked positions
+        #  leak mask identity to the downstream predictor).
+        # Initialised to a uniform distribution over the alphabet.
+        self.mask_embed = nn.Parameter(
+            torch.ones(self.alphabet_size) / float(self.alphabet_size)
+        )
+
+        # Fixed stable ratio target. Previously this was an nn.Parameter,
+        # but the gradient dL_reg/drho = -2*(M.mean - rho) pulled rho toward
+        # M.mean whenever the mask collapsed, which hollowed out the L_reg
+        # penalty over training instead of fighting the collapse. Registered
+        # as a buffer so it still moves with .to(device) but receives no
+        # gradient.
+        self.register_buffer("rho", torch.tensor(float(init_rho)))
 
     # ------------------------------------------------------------------
     def _target(self, clss: torch.Tensor) -> torch.Tensor:
@@ -258,9 +298,13 @@ class MaskedSeparatorModel(nn.Module):
         M = self.separator(x)                                # (B, L)
         M3 = M.unsqueeze(-1)                                 # (B, L, 1)
 
-        # 3. stable / environmental sub-sequences
-        x_st = x * M3
-        x_en = x * (1.0 - M3)
+        # 3. stable / environmental sub-sequences. Positions that are not
+        # selected into the sub-sequence get the learnable mask token rather
+        # than a zero vector — otherwise y_head can (and does) collapse into
+        # "zero input -> constant output", trivialising the mask.
+        bkg = self.mask_embed.view(1, 1, -1)                 # (1, 1, K)
+        x_st = x * M3 + bkg * (1.0 - M3)
+        x_en = x * (1.0 - M3) + bkg * M3
 
         # 4. per-sample squared error on x_st
         y = self._target(clss)                               # (B, 1)
@@ -276,9 +320,8 @@ class MaskedSeparatorModel(nn.Module):
         else:
             L_inv = per_sample.new_zeros(())
 
-        # 7. mask regularisation
-        rho = self.rho.clamp(0.05, 0.95)
-        L_reg = mask_regularisation(M, rho)
+        # 7. mask regularisation (rho is a frozen buffer)
+        L_reg = mask_regularisation(M, self.rho, lambda_bimodal=self.lambda_bimodal)
 
         total = L_sta + self.lambda_reg * L_reg + self.beta_inv * L_inv
 
@@ -287,7 +330,7 @@ class MaskedSeparatorModel(nn.Module):
             "L_sta": L_sta.detach(),
             "L_reg": L_reg.detach(),
             "L_inv": L_inv.detach(),
-            "rho":   rho.detach(),
+            "rho":   self.rho.detach(),
             "mask_mean": M.mean().detach(),
             # expose intermediates if the trainer wants them
             "M":    M.detach(),
@@ -313,8 +356,9 @@ class MaskedSeparatorModel(nn.Module):
 
         M = self.separator(x_soft)                           # (B, L)
         M3 = M.unsqueeze(-1)
-        x_st = x_soft * M3
-        x_en = x_soft * (1.0 - M3)
+        bkg = self.mask_embed.view(1, 1, -1)                 # (1, 1, K)
+        x_st = x_soft * M3 + bkg * (1.0 - M3)
+        x_en = x_soft * (1.0 - M3) + bkg * M3
         return M, x_st, x_en
 
     # ------------------------------------------------------------------
