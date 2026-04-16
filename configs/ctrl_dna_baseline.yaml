@@ -25,7 +25,7 @@ seed: 42
 ctrl_dna:
   # Absolute path to a checkout of https://github.com/xinyuli1204/Ctrl-DNA
   # (contains the regLM-style Lightning agent and training scripts).
-  repo_path: /path/to/Ctrl-DNA
+  repo_path: /nfs/team361/dj16/projects/sequence_generation_baselines/Ctrl-DNA
 
   # Trained Ctrl-DNA agent checkpoint produced by the upstream repo's
   # training scripts (e.g. `reinforce_lagrange_enhancers.sh`).
@@ -38,8 +38,8 @@ ctrl_dna:
 
   # Temperature for nucleus sampling (regLM default is 1.0).
   temperature: 1.0
-  top_k: 0           # 0 -> disabled
-  top_p: 1.0         # 1.0 -> disabled
+  top_k: 0 # 0 -> disabled
+  top_p: 1.0 # 1.0 -> disabled
 
 # ---------------------------------------------------------------------------
 # Our ensemble regressor for scoring (mu, sigma) — same model used by
@@ -48,15 +48,15 @@ ctrl_dna:
 ensemble:
   checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
   num_members: 5
-  hidden_dim:  128
-  depth:       4
-  dropout:     0.1
+  hidden_dim: 128
+  depth: 4
+  dropout: 0.1
 
 model:
-  alphabet_size: 4          # A,C,G,T
+  alphabet_size: 4 # A,C,G,T
 
 sampling:
   num_batches: 10
-  batch_size:  64
-  seq_length:  200          # Gosai enhancer length
-  gamma_rank:  1.0          # score = mu - gamma_rank * sigma
+  batch_size: 64
+  seq_length: 200 # Gosai enhancer length
+  gamma_rank: 1.0 # score = mu - gamma_rank * sigma

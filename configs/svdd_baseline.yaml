@@ -28,7 +28,7 @@ svdd:
   # (the subdirectory containing diffusion_gosai.py, oracle.py, dataloader_gosai.py,
   #  models/, noise_schedule.py, utils.py, configs_gosai/, and the pretrained
   #  MDLM Gosai checkpoint).
-  repo_path: /path/to/SVDD
+  repo_path: /nfs/team361/dj16/projects/sequence_generation_baselines/SVDD/
 
   # Hydra composition for the SVDD Gosai config (relative to repo_path).
   hydra_config_dir: configs_gosai
@@ -36,16 +36,16 @@ svdd:
 
   # Path to the pretrained MDLM checkpoint SVDD decodes from.
   # Required for `plain` mode and used as the frozen prior for `mc`/`tweedie`.
-  checkpoint_path: /path/to/SVDD_data/mdlm_pretrained_gosai.ckpt
+  checkpoint_path: /nfs/team361/dj16/projects/sequence_generation_baselines/SVDD/artifacts/DNA_Diffusion:v0/last.ckpt
 
   # Decoding mode: "mc" (SVDD-MC), "tweedie" (SVDD-PM), or "plain" (no guidance)
   mode: tweedie
 
   # SVDD hyperparameters
-  sample_M: 10        # candidate width (both mc and tweedie)
-  num_steps: null     # null -> use sampling.steps from the loaded hydra config
-  options: true       # passed to controlled_sample_tweedie (SVDD-PM flag)
-  task: dna           # passed to controlled_sample_tweedie
+  sample_M: 10 # candidate width (both mc and tweedie)
+  num_steps: null # null -> use sampling.steps from the loaded hydra config
+  options: true # passed to controlled_sample_tweedie (SVDD-PM flag)
+  task: dna # passed to controlled_sample_tweedie
 
 # ---------------------------------------------------------------------------
 # Our ensemble regressor for scoring (mu, sigma) — same model used by
@@ -54,14 +54,14 @@ svdd:
 ensemble:
   checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
   num_members: 5
-  hidden_dim:  128
-  depth:       4
-  dropout:     0.1
+  hidden_dim: 128
+  depth: 4
+  dropout: 0.1
 
 model:
-  alphabet_size: 4          # A,C,G,T — SVDD's vocab (mask token excluded)
+  alphabet_size: 4 # A,C,G,T — SVDD's vocab (mask token excluded)
 
 sampling:
   num_batches: 10
-  batch_size:  64
-  gamma_rank:  1.0          # score = mu - gamma_rank * sigma
+  batch_size: 64
+  gamma_rank: 1.0 # score = mu - gamma_rank * sigma
