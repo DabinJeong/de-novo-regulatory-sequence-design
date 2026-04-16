@@ -38,7 +38,7 @@ ensemble:
   depth: 4
   dropout: 0.1
   target_idx: 0      # 0=hepg2, 1=k562, 2=sknsh
-  checkpoint_path: ./runs/ensemble/ensemble.ckpt
+  checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
 
 # ---------- inference-time guided velocity field ----------
 # u* = u_t + alpha*grad mu_hat - beta*grad sigma2_hat - (1-sqrt(lambda))*grad log p_t

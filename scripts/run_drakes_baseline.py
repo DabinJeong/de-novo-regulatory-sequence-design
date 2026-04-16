@@ -10,7 +10,7 @@ What this script does
 1. Loads a DRAKES MDLM-based discrete diffusion checkpoint (finetuned /
    pretrained / zero_alpha / cfg) from an external DRAKES checkout.
 2. Generates enhancer sequences via DRAKES' `Diffusion._sample()` API.
-3. Scores each sequence with **our** EnsembleRegressor so that
+3. Scores each sequence with our PropertyScorer so that
    (mu_hat, sigma_hat) are directly comparable to numbers produced by
    `scripts/guided_sampler.py`.
 4. Writes a CSV with columns `seq, mu, sigma, score` where
@@ -21,7 +21,7 @@ Prerequisites
 -------------
 - A checkout of https://github.com/ChenyuWang-Monica/DRAKES on disk, plus
   their Dropbox data+weights zip extracted to `drakes.base_path`.
-- Our ensemble regressor checkpoint (train via property_trainer).
+- Our PropertyScorer checkpoint (train via property_trainer).
 
 CLI
 ---
@@ -40,7 +40,7 @@ import yaml
 from ml_collections.config_dict import ConfigDict
 from tqdm import tqdm
 
-from sequence_generation.model.ensemble_regressor import EnsembleRegressor
+from sequence_generation.model.property_scorer import PropertyScorer
 
 
 INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
@@ -83,14 +83,21 @@ def load_drakes_model(drakes_cfg, device: torch.device):
     cwd_backup = os.getcwd()
     os.chdir(dna_dir)
     try:
-        from hydra import compose, initialize  # noqa: WPS433 (lazy import)
+        from hydra import compose, initialize_config_dir  # noqa: WPS433 (lazy import)
         from hydra.core.global_hydra import GlobalHydra
         import diffusion_gosai_update as diffusion_mod
         import diffusion_gosai_cfg as diffusion_cfg_mod
 
+        # initialize() resolves config_path relative to the *calling file*, not
+        # cwd, so we use initialize_config_dir with an absolute path inside the
+        # DRAKES checkout.
+        cfg_dir = os.path.abspath(
+            os.path.join(dna_dir,
+                         drakes_cfg.get("hydra_config_dir", "configs_gosai"))
+        )
         GlobalHydra.instance().clear()
-        initialize(
-            config_path=drakes_cfg.get("hydra_config_dir", "configs_gosai"),
+        initialize_config_dir(
+            config_dir=cfg_dir,
             job_name="drakes_baseline",
             version_base=None,
         )
@@ -141,9 +148,9 @@ def sample_drakes(model, kind: str, num_batches: int, batch_size: int) -> torch.
     return torch.cat(samples, dim=0)
 
 
-def load_ensemble(cfg, alphabet_size: int, device: torch.device) -> EnsembleRegressor:
+def load_scorer(cfg, alphabet_size: int, device: torch.device) -> PropertyScorer:
     ens_cfg = cfg.ensemble
-    ens = EnsembleRegressor(
+    scorer = PropertyScorer(
         alphabet_size=alphabet_size,
         num_members=ens_cfg.get("num_members", 5),
         hidden_dim=ens_cfg.get("hidden_dim", 128),
@@ -152,24 +159,24 @@ def load_ensemble(cfg, alphabet_size: int, device: torch.device) -> EnsembleRegr
     )
     ckpt = ens_cfg.checkpoint_path
     if not os.path.exists(ckpt):
-        raise FileNotFoundError(f"Ensemble checkpoint not found at {ckpt}.")
+        raise FileNotFoundError(f"PropertyScorer checkpoint not found at {ckpt}.")
     sd = torch.load(ckpt, map_location="cpu")
-    ens.load_state_dict(sd.get("model", sd))
-    ens.to(device).eval()
-    for p in ens.parameters():
+    scorer.load_state_dict(sd.get("model", sd))
+    scorer.to(device).eval()
+    for p in scorer.parameters():
         p.requires_grad_(False)
-    print(f"[ensemble] loaded {ckpt}")
-    return ens
+    print(f"[PropertyScorer] loaded {ckpt}")
+    return scorer
 
 
 @torch.no_grad()
-def score_with_ensemble(ens: EnsembleRegressor, seqs: torch.Tensor,
-                        batch_size: int = 256):
+def score_sequences(scorer: PropertyScorer, seqs: torch.Tensor,
+                    batch_size: int = 256):
     """Returns (mu, sigma) each shape (N,)."""
     mus, sigmas = [], []
     for i in range(0, seqs.size(0), batch_size):
         chunk = seqs[i:i + batch_size]
-        mu, var = ens.mu_sigma2({"seqs": chunk.to(next(ens.parameters()).device)})
+        mu, var = scorer.mu_sigma2({"seqs": chunk.to(next(scorer.parameters()).device)})
         mus.append(mu.squeeze(-1).cpu())
         sigmas.append(var.clamp_min(1e-12).sqrt().squeeze(-1).cpu())
     return torch.cat(mus, 0), torch.cat(sigmas, 0)
@@ -196,11 +203,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model, kind = load_drakes_model(config.drakes, device)
-    ens = load_ensemble(config, config.model.alphabet_size, device)
+    scorer = load_scorer(config, config.model.alphabet_size, device)
 
     s = config.sampling
     seqs = sample_drakes(model, kind, s.num_batches, s.batch_size)
-    mu, sigma = score_with_ensemble(ens, seqs)
+    mu, sigma = score_sequences(scorer, seqs)
     gamma = float(s.get("gamma_rank", 1.0))
     score = mu - gamma * sigma
 

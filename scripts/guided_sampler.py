@@ -42,7 +42,7 @@ from sequence_generation.utils.flow_utils import (
     DirichletConditionalFlow, expand_simplex,
 )
 from sequence_generation.utils.train_utils import load_generator, load_dataloader
-from sequence_generation.model.ensemble_regressor import EnsembleRegressor
+from sequence_generation.model.property_scorer import PropertyScorer
 from sequence_generation.model.masked_separator import MaskedSeparatorModel
 
 
@@ -50,7 +50,7 @@ INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
 
 
 class GuidedSampler:
-    """Frozen Dirichlet FM backbone + ensemble + GIL separator guidance."""
+    """Frozen Dirichlet FM backbone + PropertyScorer + GIL separator guidance."""
 
     def __init__(self, config):
         self.config = config
@@ -69,9 +69,9 @@ class GuidedSampler:
             alpha_max=config.model.alpha_max,
         )
 
-        # ---- ensemble property predictor (mu_hat, sigma2_hat) -------------
+        # ---- PropertyScorer (mu_hat, sigma2_hat) ----------------------------
         ens_cfg = config.get("ensemble", {})
-        self.ensemble = EnsembleRegressor(
+        self.scorer = PropertyScorer(
             alphabet_size=self.K,
             num_members=ens_cfg.get("num_members", 5),
             hidden_dim=ens_cfg.get("hidden_dim", 128),
@@ -81,15 +81,15 @@ class GuidedSampler:
         ens_ckpt = ens_cfg.get("checkpoint_path", None)
         if ens_ckpt and os.path.exists(ens_ckpt):
             sd = torch.load(ens_ckpt, map_location="cpu")
-            self.ensemble.load_state_dict(sd.get("model", sd))
-            print(f"[GuidedSampler] loaded ensemble checkpoint from {ens_ckpt}")
+            self.scorer.load_state_dict(sd.get("model", sd))
+            print(f"[GuidedSampler] loaded PropertyScorer checkpoint from {ens_ckpt}")
         else:
             raise FileNotFoundError(
-                f"Ensemble checkpoint required but not found at {ens_ckpt}. "
+                f"PropertyScorer checkpoint required but not found at {ens_ckpt}. "
                 "Train with `scripts.main_guided --train_ensemble` first."
             )
-        self.ensemble.to(self.device).eval()
-        for p in self.ensemble.parameters():
+        self.scorer.to(self.device).eval()
+        for p in self.scorer.parameters():
             p.requires_grad_(False)
 
         # ---- GIL-style separator ------------------------------------------
@@ -158,7 +158,7 @@ class GuidedSampler:
         return centroid.detach()
 
     # ----------------------------------------------------------------------
-    # ensemble gradients (property + uncertainty)
+    # PropertyScorer gradients (property + uncertainty)
     # ----------------------------------------------------------------------
     def _mu_sigma2_grads(self, xt: torch.Tensor):
         """
@@ -172,7 +172,7 @@ class GuidedSampler:
         x = xt.detach().clone().requires_grad_(True)
 
         preds = []
-        for m in self.ensemble.members:
+        for m in self.scorer.members:
             W = m.embedder.weight
             soft_emb = torch.einsum("blk,kh->blh", x, W)
             h = soft_emb.transpose(1, 2)
@@ -264,7 +264,7 @@ class GuidedSampler:
             cond_flows = (eye - xt.unsqueeze(-1)) * c_factor.unsqueeze(-2)
             u_t = (flow_probs.unsqueeze(-2) * cond_flows).sum(-1)
 
-            # ---- ensemble guidance ----------------------------------------
+            # ---- PropertyScorer guidance -----------------------------------
             grad_mu, grad_var, _, _ = self._mu_sigma2_grads(xt)
 
             # ---- GIL separator guidance -----------------------------------
@@ -289,7 +289,7 @@ class GuidedSampler:
     # ----------------------------------------------------------------------
     @torch.no_grad()
     def score_and_rank(self, seqs: torch.Tensor, ref_seqs: torch.Tensor = None):
-        mu, var = self.ensemble.mu_sigma2({"seqs": seqs.to(self.device)})
+        mu, var = self.scorer.mu_sigma2({"seqs": seqs.to(self.device)})
         mu = mu.squeeze(-1)
         sigma = var.clamp_min(1e-12).sqrt().squeeze(-1)
 
