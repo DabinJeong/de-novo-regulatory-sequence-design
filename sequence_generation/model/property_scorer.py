@@ -1,8 +1,8 @@
 """
-Ensemble property predictor (proposal: slide 14-15).
+PropertyScorer — ensemble property predictor (proposal: slide 14-15).
 
 Trains K independent SeqRegressor models on the same data with different
-random seeds / inits. At inference, the ensemble exposes:
+random seeds / inits. At inference, the PropertyScorer exposes:
 
     mu_hat(x)     = mean over K members            (predicted activity)
     sigma2_hat(x) = variance over K members        (epistemic uncertainty)
@@ -18,7 +18,7 @@ import torch.nn as nn
 from sequence_generation.model.property_regressor import SeqRegressor
 
 
-class EnsembleRegressor(nn.Module):
+class PropertyScorer(nn.Module):
     def __init__(self, alphabet_size, num_members: int = 5,
                  hidden_dim: int = 128, depth: int = 4, dropout: float = 0.1):
         super().__init__()
