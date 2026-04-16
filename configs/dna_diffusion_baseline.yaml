@@ -14,7 +14,7 @@ seed: 42
 
 dna_diffusion:
   # Absolute path to a checkout of https://github.com/pinellolab/DNA-Diffusion
-  repo_path: /path/to/DNA-Diffusion
+  repo_path: /nfs/team361/dj16/projects/sequence_generation_baselines/DNA-Diffusion
 
   # Hydra config inside <repo_path>/configs; sample.yaml composes model / data /
   # diffusion / sampling defaults.
@@ -22,7 +22,7 @@ dna_diffusion:
   hydra_config_name: sample.yaml
 
   # Path to the model checkpoint. safetensors or .pt both work.
-  checkpoint_path: /path/to/DNA-Diffusion/checkpoints/model.safetensors
+  checkpoint_path: /nfs/team361/dj16/projects/sequence_generation_baselines/DNA-Diffusion/checkpoints/model.safetensors
 
   # Which cell types to sample for. Integer tokens map to the dataset's
   # numeric_to_tag_dict; leave null to sample all cell types in the dataset.
@@ -39,14 +39,14 @@ dna_diffusion:
 ensemble:
   checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
   num_members: 5
-  hidden_dim:  128
-  depth:       4
-  dropout:     0.1
+  hidden_dim: 128
+  depth: 4
+  dropout: 0.1
 
 model:
-  alphabet_size: 4          # A,C,G,T — matches DNA-Diffusion's nucleotide order
+  alphabet_size: 4 # A,C,G,T — matches DNA-Diffusion's nucleotide order
 
 sampling:
-  number_of_samples: 640    # per cell type (DNA-Diffusion semantics)
+  number_of_samples: 640 # per cell type (DNA-Diffusion semantics)
   sample_batch_size: 64
-  gamma_rank: 1.0           # score = mu - gamma_rank * sigma
+  gamma_rank: 1.0 # score = mu - gamma_rank * sigma
