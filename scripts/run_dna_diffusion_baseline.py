@@ -12,7 +12,7 @@ What this script does
 3. Calls the repo's own `model.sample(classes, shape, cond_weight)` routine
    per requested cell type, collecting (batch, 4, L) one-hot samples.
 4. Converts the one-hots to token IDs (A=0, C=1, G=2, T=3).
-5. Scores every sequence with our EnsembleRegressor.
+5. Scores every sequence with our PropertyScorer (ensemble predictor).
 6. Writes a CSV with columns `seq, mu, sigma, score, cell_type` matching
    the schema emitted by scripts/guided_sampler.py (plus a cell_type column
    so the downstream evaluator can filter per target).
@@ -35,7 +35,7 @@ import yaml
 from ml_collections.config_dict import ConfigDict
 from tqdm import tqdm
 
-from sequence_generation.model.ensemble_regressor import EnsembleRegressor
+from sequence_generation.model.property_scorer import PropertyScorer
 
 
 INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
@@ -130,9 +130,9 @@ def sample_dna_diffusion(diffusion, data, cell_types, num_samples: int,
     return torch.cat(all_ids, dim=0), all_cts
 
 
-def load_ensemble(cfg, alphabet_size: int, device: torch.device) -> EnsembleRegressor:
+def load_scorer(cfg, alphabet_size: int, device: torch.device) -> PropertyScorer:
     ens_cfg = cfg.ensemble
-    ens = EnsembleRegressor(
+    scorer = PropertyScorer(
         alphabet_size=alphabet_size,
         num_members=ens_cfg.get("num_members", 5),
         hidden_dim=ens_cfg.get("hidden_dim", 128),
@@ -141,24 +141,24 @@ def load_ensemble(cfg, alphabet_size: int, device: torch.device) -> EnsembleRegr
     )
     ckpt = ens_cfg.checkpoint_path
     if not os.path.exists(ckpt):
-        raise FileNotFoundError(f"Ensemble checkpoint not found at {ckpt}.")
+        raise FileNotFoundError(f"PropertyScorer checkpoint not found at {ckpt}.")
     sd = torch.load(ckpt, map_location="cpu")
-    ens.load_state_dict(sd.get("model", sd))
-    ens.to(device).eval()
-    for p in ens.parameters():
+    scorer.load_state_dict(sd.get("model", sd))
+    scorer.to(device).eval()
+    for p in scorer.parameters():
         p.requires_grad_(False)
-    print(f"[ensemble] loaded {ckpt}")
-    return ens
+    print(f"[PropertyScorer] loaded {ckpt}")
+    return scorer
 
 
 @torch.no_grad()
-def score_with_ensemble(ens: EnsembleRegressor, seqs: torch.Tensor,
-                        batch_size: int = 256):
+def score_sequences(scorer: PropertyScorer, seqs: torch.Tensor,
+                    batch_size: int = 256):
     mus, sigmas = [], []
-    device = next(ens.parameters()).device
+    device = next(scorer.parameters()).device
     for i in range(0, seqs.size(0), batch_size):
         chunk = seqs[i:i + batch_size].to(device)
-        mu, var = ens.mu_sigma2({"seqs": chunk})
+        mu, var = scorer.mu_sigma2({"seqs": chunk})
         mus.append(mu.squeeze(-1).cpu())
         sigmas.append(var.clamp_min(1e-12).sqrt().squeeze(-1).cpu())
     return torch.cat(mus, 0), torch.cat(sigmas, 0)
@@ -186,7 +186,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     diffusion, data = load_dna_diffusion(config.dna_diffusion, device)
-    ens = load_ensemble(config, config.model.alphabet_size, device)
+    scorer = load_scorer(config, config.model.alphabet_size, device)
 
     s = config.sampling
     seqs, cts = sample_dna_diffusion(
@@ -196,7 +196,7 @@ def main():
         batch_size=s.sample_batch_size,
         guidance_scale=config.dna_diffusion.guidance_scale,
     )
-    mu, sigma = score_with_ensemble(ens, seqs)
+    mu, sigma = score_sequences(scorer, seqs)
     gamma = float(s.get("gamma_rank", 1.0))
     score = mu - gamma * sigma
 

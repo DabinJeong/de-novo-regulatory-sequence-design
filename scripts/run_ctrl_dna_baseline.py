@@ -15,7 +15,7 @@ What this script does
 ---------------------
 1. Loads a trained Ctrl-DNA regLM agent from disk.
 2. Samples N enhancer sequences conditioned on a cell-type label prefix.
-3. Scores each sequence with **our** EnsembleRegressor so that
+3. Scores each sequence with our PropertyScorer so that
    (mu_hat, sigma_hat) are directly comparable to numbers produced by
    the other baseline runners and scripts/guided_sampler.py.
 4. Writes a CSV with columns `seq, mu, sigma, score` where
@@ -38,7 +38,7 @@ import yaml
 from ml_collections.config_dict import ConfigDict
 from tqdm import tqdm
 
-from sequence_generation.model.ensemble_regressor import EnsembleRegressor
+from sequence_generation.model.property_scorer import PropertyScorer
 
 
 INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
@@ -100,7 +100,7 @@ def sample_ctrl_dna(agent, ctrl_cfg, num_batches: int,
     Ctrl-DNA's Agent follows regLM's `get_data` / `decode` conventions:
     `get_data(label, n, length)` returns raw token indices; `decode`
     turns them into ACGT strings. We go the other way so we can reuse
-    our ensemble regressor which expects integer-coded sequences.
+    our PropertyScorer which expects integer-coded sequences.
     """
     prefix = ctrl_cfg.get("cell_type_prefix", None)
     temperature = float(ctrl_cfg.get("temperature", 1.0))
@@ -144,9 +144,9 @@ def sample_ctrl_dna(agent, ctrl_cfg, num_batches: int,
     return torch.cat(all_seqs, dim=0)
 
 
-def load_ensemble(cfg, alphabet_size: int, device: torch.device) -> EnsembleRegressor:
+def load_scorer(cfg, alphabet_size: int, device: torch.device) -> PropertyScorer:
     ens_cfg = cfg.ensemble
-    ens = EnsembleRegressor(
+    scorer = PropertyScorer(
         alphabet_size=alphabet_size,
         num_members=ens_cfg.get("num_members", 5),
         hidden_dim=ens_cfg.get("hidden_dim", 128),
@@ -155,23 +155,23 @@ def load_ensemble(cfg, alphabet_size: int, device: torch.device) -> EnsembleRegr
     )
     ckpt = ens_cfg.checkpoint_path
     if not os.path.exists(ckpt):
-        raise FileNotFoundError(f"Ensemble checkpoint not found at {ckpt}.")
+        raise FileNotFoundError(f"PropertyScorer checkpoint not found at {ckpt}.")
     sd = torch.load(ckpt, map_location="cpu")
-    ens.load_state_dict(sd.get("model", sd))
-    ens.to(device).eval()
-    for p in ens.parameters():
+    scorer.load_state_dict(sd.get("model", sd))
+    scorer.to(device).eval()
+    for p in scorer.parameters():
         p.requires_grad_(False)
-    print(f"[ensemble] loaded {ckpt}")
-    return ens
+    print(f"[PropertyScorer] loaded {ckpt}")
+    return scorer
 
 
 @torch.no_grad()
-def score_with_ensemble(ens: EnsembleRegressor, seqs: torch.Tensor,
-                        batch_size: int = 256):
+def score_sequences(scorer: PropertyScorer, seqs: torch.Tensor,
+                    batch_size: int = 256):
     mus, sigmas = [], []
     for i in range(0, seqs.size(0), batch_size):
         chunk = seqs[i:i + batch_size]
-        mu, var = ens.mu_sigma2({"seqs": chunk.to(next(ens.parameters()).device)})
+        mu, var = scorer.mu_sigma2({"seqs": chunk.to(next(scorer.parameters()).device)})
         mus.append(mu.squeeze(-1).cpu())
         sigmas.append(var.clamp_min(1e-12).sqrt().squeeze(-1).cpu())
     return torch.cat(mus, 0), torch.cat(sigmas, 0)
@@ -198,7 +198,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     agent = load_ctrl_dna_agent(config.ctrl_dna, device)
-    ens = load_ensemble(config, config.model.alphabet_size, device)
+    scorer = load_scorer(config, config.model.alphabet_size, device)
 
     s = config.sampling
     seqs = sample_ctrl_dna(
@@ -206,7 +206,7 @@ def main():
         num_batches=s.num_batches, batch_size=s.batch_size,
         seq_length=s.seq_length, device=device,
     )
-    mu, sigma = score_with_ensemble(ens, seqs)
+    mu, sigma = score_sequences(scorer, seqs)
     gamma = float(s.get("gamma_rank", 1.0))
     score = mu - gamma * sigma
 

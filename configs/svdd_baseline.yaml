@@ -28,7 +28,7 @@ svdd:
   # (the subdirectory containing diffusion_gosai.py, oracle.py, dataloader_gosai.py,
   #  models/, noise_schedule.py, utils.py, configs_gosai/, and the pretrained
   #  MDLM Gosai checkpoint).
-  repo_path: /path/to/SVDD
+  repo_path: /nfs/team361/dj16/projects/sequence_generation_baselines/SVDD
 
   # Hydra composition for the SVDD Gosai config (relative to repo_path).
   hydra_config_dir: configs_gosai
@@ -36,7 +36,7 @@ svdd:
 
   # Path to the pretrained MDLM checkpoint SVDD decodes from.
   # Required for `plain` mode and used as the frozen prior for `mc`/`tweedie`.
-  checkpoint_path: /path/to/SVDD_data/mdlm_pretrained_gosai.ckpt
+  checkpoint_path: "/nfs/team361/dj16/projects/sequence_generation_baselines/SVDD/artifacts/DNA_Diffusion:v0/last.ckpt"
 
   # Decoding mode: "mc" (SVDD-MC), "tweedie" (SVDD-PM), or "plain" (no guidance)
   mode: tweedie

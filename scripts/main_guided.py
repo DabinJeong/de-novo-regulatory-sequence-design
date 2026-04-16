@@ -31,7 +31,7 @@ def main():
     config.out_dir = args.out_dir
 
     if args.train_ensemble:
-        from scripts.ensemble_trainer import EnsembleTrainer
+        from scripts.property_scorer_trainer import EnsembleTrainer
         EnsembleTrainer(config).train()
 
     elif args.generate:

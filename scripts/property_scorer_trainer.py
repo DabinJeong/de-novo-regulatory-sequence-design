@@ -1,5 +1,5 @@
 """
-Trainer for the ensemble property predictor (proposal: slide 14-15).
+Trainer for the PropertyScorer (proposal: slide 14-15).
 
 Trains K independent SeqRegressor members with different seeds and saves a
 single checkpoint that GuidedSampler can load.
@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from sequence_generation.utils.train_utils import load_dataloader, load_seed
-from sequence_generation.model.ensemble_regressor import EnsembleRegressor
+from sequence_generation.model.property_scorer import PropertyScorer
 
 
 class EnsembleTrainer:
@@ -26,7 +26,7 @@ class EnsembleTrainer:
 
         self.train_loader, self.eval_loader, _ = load_dataloader(config)
 
-        self.model = EnsembleRegressor(
+        self.model = PropertyScorer(
             alphabet_size=config.model.alphabet_size,
             num_members=self.num_members,
             hidden_dim=ens_cfg.get("hidden_dim", 128),
@@ -68,6 +68,6 @@ class EnsembleTrainer:
                     losses.append(loss.item())
                 print(f"  member {member_idx} epoch {epoch+1}  train_mse={sum(losses)/len(losses):.4f}")
 
-        ckpt_path = os.path.join(self.out_dir, "ensemble.ckpt")
+        ckpt_path = os.path.join(self.out_dir, "ensemble_best.ckpt")
         torch.save({"model": self.model.state_dict()}, ckpt_path)
         print(f"\nSaved ensemble checkpoint -> {ckpt_path}")

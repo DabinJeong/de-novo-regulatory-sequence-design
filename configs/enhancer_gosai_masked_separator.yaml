@@ -47,10 +47,11 @@ masked_separator:
   target_idx: null          # null -> regress on mean(hepg2, k562, sknsh)
                             # set 0 / 1 / 2 for a single cell line target
   beta_inv:     1.0         # V-REx penalty weight
-  lambda_reg:   1.0         # mask regularisation weight
-  init_rho:     0.3         # initial learnable stable ratio
+  lambda_reg:   5.0         # mask regularisation weight (symmetric quadratic)
+  lambda_bimodal: 0.0       # bimodal term weight; keep 0 during primary training
+  init_rho:     0.3         # fixed target stable ratio (not learnable)
   num_envs:     3           # K for K-means env inference
-  warmup_epochs: 1          # epochs with L_inv disabled
+  warmup_epochs: 5          # epochs with L_inv disabled
   env_infer_every: 1        # re-run K-means every N epochs
   kmeans_iters: 20
   kmeans_samples: 8192      # cap on samples used for K-means fit per epoch
