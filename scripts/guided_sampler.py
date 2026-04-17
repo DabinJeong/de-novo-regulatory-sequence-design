@@ -124,6 +124,18 @@ class GuidedSampler:
         self.flow_temp = s.get("flow_temp", 1.0)
         self.prior_pseudocount = s.get("prior_pseudocount", 0.1)
 
+        # ---- asymmetric noise initialisation ------------------------------
+        # Stratified Dirichlet x_0: low noise at x_st positions of a
+        # reference sequence, full noise (uniform) at x_en positions.
+        an_cfg = s.get("asymmetric_noise", {})
+        self.an_enabled          = an_cfg.get("enabled", False)
+        self.an_reference_source = an_cfg.get("reference_source", "dataset")
+        self.an_reference_path   = an_cfg.get("reference_path", None)
+        self.an_reference_split  = an_cfg.get("reference_split", "train")
+        self.an_tau_st           = float(an_cfg.get("tau_st", 8.0))
+        self.an_tau_en           = float(an_cfg.get("tau_en", 1.0))
+        self._an_ref_pool = None     # (N, L) long tensor, lazily loaded
+
         # ---- env centroids: either from checkpoint or recompute ----------
         if env_centroids is not None:
             self.env_centroids = env_centroids.to(self.device)
@@ -156,6 +168,65 @@ class GuidedSampler:
         feats = torch.cat(feats, dim=0)
         centroid = feats.mean(dim=0, keepdim=True)           # (1, H)
         return centroid.detach()
+
+    # ----------------------------------------------------------------------
+    # Reference pool for asymmetric-noise init
+    # ----------------------------------------------------------------------
+    @torch.no_grad()
+    def _load_an_reference_pool(self, cap: int = 8192) -> torch.Tensor:
+        """Return a cached (N, L) long tensor of reference token ids."""
+        if self._an_ref_pool is not None:
+            return self._an_ref_pool
+
+        if self.an_reference_source == "file" and self.an_reference_path:
+            import pandas as pd
+            df = pd.read_csv(self.an_reference_path)
+            col = "seq" if "seq" in df.columns else df.columns[0]
+            base_to_int = {"A": 0, "C": 1, "G": 2, "T": 3}
+            ids = torch.tensor(
+                [[base_to_int[c] for c in s] for s in df[col].tolist()],
+                dtype=torch.long,
+            )
+        else:
+            train_loader, val_loader, test_loader = load_dataloader(self.config)
+            loader = {
+                "train": train_loader, "val": val_loader, "test": test_loader,
+            }[self.an_reference_split]
+            chunks = []
+            collected = 0
+            for batch in loader:
+                chunks.append(batch["seqs"])
+                collected += batch["seqs"].size(0)
+                if collected >= cap:
+                    break
+            ids = torch.cat(chunks, dim=0)[:cap]
+
+        self._an_ref_pool = ids.to(self.device)
+        print(f"[GuidedSampler] asymmetric-noise reference pool: "
+              f"{self._an_ref_pool.size(0)} seqs "
+              f"(source={self.an_reference_source}, split={self.an_reference_split})")
+        return self._an_ref_pool
+
+    @torch.no_grad()
+    def _sample_asymmetric_init(self, B: int, L: int) -> torch.Tensor:
+        """
+        Stratified Dirichlet init:
+            alpha_pos = M_ref * tau_st * x_ref + (1 - M_ref) * (tau_en / K)
+        so that st positions are peaked on x_ref and en positions are near
+        uniform. Returns xt of shape (B, L, K).
+        """
+        pool = self._load_an_reference_pool()
+        idx = torch.randint(0, pool.size(0), (B,), device=self.device)
+        x_ref_ids = pool[idx]                                            # (B, L)
+        x_ref = F.one_hot(x_ref_ids.long(), num_classes=self.K).float()  # (B, L, K)
+        M_ref, _, _ = self.separator_model.separate(x_ref_ids, soft_input=False)
+        M3 = M_ref.unsqueeze(-1)                                         # (B, L, 1)
+
+        alpha_st = self.an_tau_st * x_ref                                # (B, L, K)
+        alpha_en = (self.an_tau_en / float(self.K)) * torch.ones_like(x_ref)
+        alpha = M3 * alpha_st + (1.0 - M3) * alpha_en
+        alpha = alpha.clamp(min=1e-3)
+        return torch.distributions.Dirichlet(alpha).sample()
 
     # ----------------------------------------------------------------------
     # PropertyScorer gradients (property + uncertainty)
@@ -241,9 +312,12 @@ class GuidedSampler:
         device = self.device
         K = self.K
 
-        xt = torch.distributions.Dirichlet(
-            torch.ones(B, L, K, device=device)
-        ).sample()
+        if self.an_enabled:
+            xt = self._sample_asymmetric_init(B, L)
+        else:
+            xt = torch.distributions.Dirichlet(
+                torch.ones(B, L, K, device=device)
+            ).sample()
         eye = torch.eye(K, device=device)
 
         t_span = torch.linspace(

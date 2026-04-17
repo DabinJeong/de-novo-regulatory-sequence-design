@@ -54,6 +54,24 @@ sampling:
   delta_rank:        0.0     # ranking: +delta * novelty(x)
   num_sample_batches: 2
 
+  # ---- asymmetric noise init ------------------------------------------
+  # Replaces the uniform-Dirichlet x_0 with a stratified Dirichlet whose
+  # concentration differs between x_st and x_en positions of a reference
+  # sequence. x_st positions start peaked on x_ref (low noise); x_en
+  # positions start near uniform (full noise). Analogous to protein-design
+  # stratified SDEdit: hold the motif, resample the scaffold.
+  #   alpha_pos = M_ref * (tau_st * x_ref + eps)          at st positions
+  #             + (1 - M_ref) * (tau_en / K * ones)       at en positions
+  # tau_st large (e.g. 8) -> peaked on x_ref;
+  # tau_en == 1 -> symmetric Dirichlet(1) (uniform), same as default init.
+  asymmetric_noise:
+    enabled: false
+    reference_source: dataset     # "dataset" | "file"
+    reference_path: null          # CSV with a "seq" column if "file"
+    reference_split: train        # train | val | test  (if "dataset")
+    tau_st: 8.0                   # concentration at x_st (large -> near x_ref)
+    tau_en: 1.0                   # concentration at x_en (1 -> uniform)
+
 train:
   num_epochs: 5
   lr: 0.0001
