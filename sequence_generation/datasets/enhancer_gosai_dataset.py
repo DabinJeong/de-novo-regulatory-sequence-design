@@ -31,19 +31,36 @@ def get_dataloaders_gosai(config, skip_valid=False, valid_seed=42):
            f'Eval Batch Size for {config.eval.batch_size} '
            f'not divisible by {num_gpus}.')
     full_set = GosaiDataset(config.dataset.data_path)
-    # randomly sample a subset of the full set as valid/test (unchanged behavior)
-    valid_set = torch.utils.data.Subset(full_set, np.random.choice(len(full_set), 40000, replace=False))
-    test_set = torch.utils.data.Subset(full_set, np.random.choice(len(full_set), 40000, replace=False))
-    # Optional: subsample the training set for faster epochs.
-    train_size = config.dataset.get("train_size", None)
-    if train_size is not None and train_size < len(full_set):
-        rng = np.random.RandomState(config.get("seed", 42))
-        idx = rng.choice(len(full_set), int(train_size), replace=False)
-        train_set = torch.utils.data.Subset(full_set, idx)
-        print(f"[gosai] subsampled train set to {len(train_set)} examples "
-              f"(full={len(full_set)})")
-    else:
-        train_set = full_set
+    N = len(full_set)
+
+    # One seeded permutation produces disjoint train / val / test index sets.
+    # Previously each split was drawn with an independent np.random.choice from
+    # the full dataset, which (a) used the uncontrolled global NumPy RNG for
+    # val/test and (b) allowed heavy overlap between train and the evaluation
+    # splits — invalidating held-out metrics.
+    split_seed = int(config.dataset.get("split_seed", 42))
+    val_size   = int(config.dataset.get("val_size",   40000))
+    test_size  = int(config.dataset.get("test_size",  40000))
+    if val_size + test_size >= N:
+        raise ValueError(
+            f"val_size ({val_size}) + test_size ({test_size}) must be < "
+            f"len(dataset) ({N})"
+        )
+    perm = np.random.RandomState(split_seed).permutation(N)
+    test_idx  = perm[:test_size]
+    valid_idx = perm[test_size : test_size + val_size]
+    train_idx = perm[test_size + val_size :]
+
+    train_cap = config.dataset.get("train_size", None)
+    if train_cap is not None and int(train_cap) < len(train_idx):
+        train_idx = train_idx[: int(train_cap)]
+
+    train_set = torch.utils.data.Subset(full_set, train_idx)
+    valid_set = torch.utils.data.Subset(full_set, valid_idx)
+    test_set  = torch.utils.data.Subset(full_set, test_idx)
+    print(f"[gosai] split sizes: train={len(train_set)}  "
+          f"val={len(valid_set)}  test={len(test_set)}  "
+          f"(disjoint, split_seed={split_seed}, full={N})")
 
     train_loader = torch.utils.data.DataLoader(train_set,
                                                batch_size=config.loader.batch_size,
