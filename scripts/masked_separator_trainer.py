@@ -199,7 +199,8 @@ class MaskedSeparatorTrainer:
             # ---- (B) separator + y-head update step --------------------
             self.model.train()
             agg = {"loss": 0.0, "L_sta": 0.0, "L_reg": 0.0,
-                   "L_inv": 0.0, "rho": 0.0, "mask_mean": 0.0}
+                   "L_inv": 0.0, "L_smooth": 0.0,
+                   "rho": 0.0, "mask_mean": 0.0}
             n = 0
             for batch in tqdm(self.train_loader, desc=f"epoch {epoch+1} [update]"):
                 x    = batch["seqs"].to(self.device)
@@ -217,7 +218,8 @@ class MaskedSeparatorTrainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
 
-                for k in ("loss", "L_sta", "L_reg", "L_inv", "rho", "mask_mean"):
+                for k in ("loss", "L_sta", "L_reg", "L_inv", "L_smooth",
+                         "rho", "mask_mean"):
                     v = out[k]
                     agg[k] += float(v.item() if torch.is_tensor(v) else v)
                 n += 1
@@ -229,6 +231,7 @@ class MaskedSeparatorTrainer:
                 f"L_sta={avg['L_sta']:.4f}  "
                 f"L_inv={avg['L_inv']:.4f}  "
                 f"L_reg={avg['L_reg']:.4f}  "
+                f"L_smooth={avg['L_smooth']:.4f}  "
                 f"rho={avg['rho']:.3f}  "
                 f"mask_mean={avg['mask_mean']:.3f}"
             )
