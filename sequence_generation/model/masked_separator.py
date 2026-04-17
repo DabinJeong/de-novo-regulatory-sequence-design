@@ -166,6 +166,25 @@ def mask_regularisation(
     return mean_term
 
 
+def tv_smoothness(M: torch.Tensor) -> torch.Tensor:
+    """
+    Total-variation penalty on the per-position mask (fused-lasso style).
+
+        L_smooth = mean(|M[:, i+1] - M[:, i]|)
+
+    Penalises transitions between adjacent positions, so the optimiser is
+    rewarded for placing selected positions next to each other rather than
+    scattering them. Minimum (0) is reached by any constant-along-L mask,
+    so it must be combined with the mean-anchoring term in `mask_regularisation`
+    to avoid the degenerate all-zero / all-one solution.
+
+    Reference:
+        Lei et al., "Rationalizing Neural Predictions", EMNLP 2016 — original
+        fused-lasso term on binary rationale selections.
+    """
+    return (M[:, 1:] - M[:, :-1]).abs().mean()
+
+
 def v_rex_penalty(
     per_sample_loss: torch.Tensor,
     env_ids: torch.Tensor,
@@ -228,6 +247,7 @@ class MaskedSeparatorModel(nn.Module):
         self.beta_inv       = de_cfg.get("beta_inv", 1.0)         # V-REx weight
         self.lambda_reg     = de_cfg.get("lambda_reg", 1.0)       # overall L_reg scale
         self.lambda_bimodal = de_cfg.get("lambda_bimodal", 0.0)   # bimodal sub-weight
+        self.lambda_smooth  = de_cfg.get("lambda_smooth", 0.0)    # TV smoothness weight
         self.num_envs       = de_cfg.get("num_envs", 3)           # K for K-means
         self.target_idx     = de_cfg.get("target_idx", None)      # None -> mean over tasks
         init_rho            = de_cfg.get("init_rho", 0.3)
@@ -323,13 +343,25 @@ class MaskedSeparatorModel(nn.Module):
         # 7. mask regularisation (rho is a frozen buffer)
         L_reg = mask_regularisation(M, self.rho, lambda_bimodal=self.lambda_bimodal)
 
-        total = L_sta + self.lambda_reg * L_reg + self.beta_inv * L_inv
+        # 8. spatial smoothness (fused-lasso) — optional, disabled at 0.0
+        if self.lambda_smooth > 0.0:
+            L_smooth = tv_smoothness(M)
+        else:
+            L_smooth = M.new_zeros(())
+
+        total = (
+            L_sta
+            + self.lambda_reg    * L_reg
+            + self.beta_inv      * L_inv
+            + self.lambda_smooth * L_smooth
+        )
 
         return {
             "loss":  total,
             "L_sta": L_sta.detach(),
             "L_reg": L_reg.detach(),
             "L_inv": L_inv.detach(),
+            "L_smooth": L_smooth.detach(),
             "rho":   self.rho.detach(),
             "mask_mean": M.mean().detach(),
             # expose intermediates if the trainer wants them

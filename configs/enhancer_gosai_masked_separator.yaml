@@ -50,6 +50,8 @@ masked_separator:
   beta_inv: 1.0 # V-REx penalty weight
   lambda_reg: 5.0 # mask regularisation weight (symmetric quadratic)
   lambda_bimodal: 0.0 # bimodal term weight; keep 0 during primary training
+  lambda_smooth: 0.1 # TV smoothness on adjacent M values (0.0 = off; encourages
+                     # contiguous invariant blocks; too large collapses to one block)
   init_rho: 0.3 # fixed target stable ratio (not learnable)
   num_envs: 3 # K for K-means env inference
   warmup_epochs: 5 # epochs with L_inv disabled
