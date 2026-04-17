@@ -124,6 +124,19 @@ class GuidedSampler:
         self.flow_temp = s.get("flow_temp", 1.0)
         self.prior_pseudocount = s.get("prior_pseudocount", 0.1)
 
+        # ---- bounded guidance (position-wise grad mask + soft leash) ------
+        # Drawn fresh per batch. When disabled, the sampler behaves exactly
+        # as before. Reference sequences anchor x_st positions so that
+        # activity-optimizing edits concentrate on x_en (env) positions.
+        bg_cfg = s.get("bounded_guidance", {})
+        self.bg_enabled          = bg_cfg.get("enabled", False)
+        self.bg_reference_source = bg_cfg.get("reference_source", "dataset")
+        self.bg_reference_path   = bg_cfg.get("reference_path", None)
+        self.bg_reference_split  = bg_cfg.get("reference_split", "train")
+        self.bg_grad_mask_mode   = bg_cfg.get("grad_mask_mode", "none")
+        self.bg_leash_weight     = float(bg_cfg.get("leash_weight", 0.0))
+        self._bg_ref_pool = None     # (N, L) long tensor, lazily loaded
+
         # ---- env centroids: either from checkpoint or recompute ----------
         if env_centroids is not None:
             self.env_centroids = env_centroids.to(self.device)
@@ -156,6 +169,54 @@ class GuidedSampler:
         feats = torch.cat(feats, dim=0)
         centroid = feats.mean(dim=0, keepdim=True)           # (1, H)
         return centroid.detach()
+
+    # ----------------------------------------------------------------------
+    # Reference pool for bounded guidance / asymmetric init
+    # ----------------------------------------------------------------------
+    @torch.no_grad()
+    def _load_reference_pool(self, cap: int = 8192) -> torch.Tensor:
+        """Return a cached (N, L) long tensor of reference token ids."""
+        if self._bg_ref_pool is not None:
+            return self._bg_ref_pool
+
+        if self.bg_reference_source == "file" and self.bg_reference_path:
+            import pandas as pd
+            df = pd.read_csv(self.bg_reference_path)
+            col = "seq" if "seq" in df.columns else df.columns[0]
+            base_to_int = {"A": 0, "C": 1, "G": 2, "T": 3}
+            ids = torch.tensor(
+                [[base_to_int[c] for c in s] for s in df[col].tolist()],
+                dtype=torch.long,
+            )
+        else:
+            train_loader, val_loader, test_loader = load_dataloader(self.config)
+            loader = {
+                "train": train_loader, "val": val_loader, "test": test_loader,
+            }[self.bg_reference_split]
+            chunks = []
+            collected = 0
+            for batch in loader:
+                chunks.append(batch["seqs"])
+                collected += batch["seqs"].size(0)
+                if collected >= cap:
+                    break
+            ids = torch.cat(chunks, dim=0)[:cap]
+
+        self._bg_ref_pool = ids.to(self.device)
+        print(f"[GuidedSampler] bounded-guidance reference pool: "
+              f"{self._bg_ref_pool.size(0)} seqs "
+              f"(source={self.bg_reference_source}, split={self.bg_reference_split})")
+        return self._bg_ref_pool
+
+    @torch.no_grad()
+    def _draw_reference_batch(self, B: int):
+        """Sample B reference seqs; return (x_ref_onehot, M_ref)."""
+        pool = self._load_reference_pool()
+        idx = torch.randint(0, pool.size(0), (B,), device=self.device)
+        x_ref_ids = pool[idx]                                            # (B, L)
+        x_ref = F.one_hot(x_ref_ids.long(), num_classes=self.K).float()  # (B, L, K)
+        M_ref, _, _ = self.separator_model.separate(x_ref_ids, soft_input=False)
+        return x_ref, M_ref                                              # (B,L,K),(B,L)
 
     # ----------------------------------------------------------------------
     # PropertyScorer gradients (property + uncertainty)
@@ -246,6 +307,14 @@ class GuidedSampler:
         ).sample()
         eye = torch.eye(K, device=device)
 
+        # ---- bounded guidance: draw reference batch once per sample() ----
+        if self.bg_enabled:
+            x_ref, M_ref = self._draw_reference_batch(B)           # (B,L,K),(B,L)
+            M_ref3 = M_ref.unsqueeze(-1)                           # (B,L,1)
+        else:
+            x_ref = None
+            M_ref3 = None
+
         t_span = torch.linspace(
             1.0, self.config.model.alpha_max,
             steps=self.n_steps, device=device,
@@ -270,6 +339,22 @@ class GuidedSampler:
             # ---- GIL separator guidance -----------------------------------
             grad_stable, grad_en_push = self._gil_grads(xt)
 
+            # ---- bounded guidance: position-wise gradient masking --------
+            # Keeps property/uncertainty gradients from acting on one region.
+            # "en_only" implements the "conservative x_st, free x_en" design.
+            if self.bg_enabled and self.bg_grad_mask_mode != "none":
+                if self.bg_grad_mask_mode == "en_only":
+                    gmask = 1.0 - M_ref3
+                elif self.bg_grad_mask_mode == "st_only":
+                    gmask = M_ref3
+                else:
+                    raise ValueError(
+                        f"bounded_guidance.grad_mask_mode must be "
+                        f"'none'|'st_only'|'en_only', got {self.bg_grad_mask_mode!r}"
+                    )
+                grad_mu  = grad_mu  * gmask
+                grad_var = grad_var * gmask
+
             u_star = (
                 u_t
                 + self.alpha_g * grad_mu
@@ -277,6 +362,14 @@ class GuidedSampler:
                 + self.eta_st  * grad_stable
                 + self.xi_en * (self.lam ** 0.5) * grad_en_push
             )
+
+            # ---- bounded guidance: soft quadratic leash on x_st ----------
+            # L_leash = || M_ref * (xt - x_ref) ||^2 (position-wise weight).
+            # Gradient pulls xt toward x_ref only where M_ref is high.
+            if self.bg_enabled and self.bg_leash_weight > 0.0:
+                leash_grad = 2.0 * M_ref3 * (xt - x_ref)
+                leash_grad = leash_grad - leash_grad.mean(-1, keepdim=True)
+                u_star = u_star - self.bg_leash_weight * leash_grad
 
             xt = (xt + u_star * (t - s)).clamp(min=1e-8)
             xt = xt / xt.sum(-1, keepdim=True)

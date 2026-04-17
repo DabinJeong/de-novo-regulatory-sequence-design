@@ -54,6 +54,25 @@ sampling:
   delta_rank:        0.0     # ranking: +delta * novelty(x)
   num_sample_batches: 2
 
+  # ---- bounded guidance -----------------------------------------------
+  # Conservative edits on x_st positions (invariant / motif-like) while
+  # leaving x_en positions free. Requires the GIL separator checkpoint.
+  # Two independent levers:
+  #   (1) grad_mask_mode  : restricts property/uncertainty gradients to
+  #                         one sub-region. "st_only" / "en_only" / "none".
+  #   (2) leash_weight    : soft quadratic pull toward a reference sequence,
+  #                         weighted per-position by M_ref so only st
+  #                         positions are leashed.
+  # Reference sequences are drawn fresh per batch from the training set
+  # (reference_source="dataset") or from a CSV (reference_source="file").
+  bounded_guidance:
+    enabled: false
+    reference_source: dataset     # "dataset" | "file"
+    reference_path: null          # CSV with a "seq" column if "file"
+    reference_split: train        # train | val | test  (if "dataset")
+    grad_mask_mode: none          # none | st_only | en_only
+    leash_weight: 0.0             # λ on quadratic soft leash
+
 train:
   num_epochs: 5
   lr: 0.0001
