@@ -26,8 +26,14 @@ ENV_PATH="/nfs/team361/dj16/pypoetry/virtualenvs/sequence-generation-7Ds7Y9Ey-py
 
 
 # === Training ===
-# Without DDP
-python -u -m scripts.main --train --config ${run_dir}/configs/enhancer_gosai_masked_separator.yaml --out_dir ${output_dir}/sequence_generation_${LSB_JOBID}
+# # Without DDP
+# python -u -m scripts.main --train --config ${run_dir}/configs/enhancer_gosai_masked_separator.yaml --out_dir ${output_dir}/sequence_generation_${LSB_JOBID}
 
 # With DDP
 # torchrun --standalone --nproc_per_node 2 -m scripts.main --train --config ${run_dir}/configs/enhancer_gosai.yaml --out_dir ${output_dir}/sequence_generation_${LSB_JOBID}
+
+# === Analyze seq contents of invariant/env subsequeces ===
+python -m scripts.analyze_invariant_separator --config configs/enhancer_gosai_masked_separator.yaml --ckpt runs/masked_separator/masked_separator_best.ckpt --out_dir runs/masked_separator/analysis --num_samples 4000 --split val
+
+# === Visualize mask ===
+python -m scripts.visualize_mask_structure --config configs/enhancer_gosai_masked_separator.yaml --ckpt   runs/masked_separator/masked_separator_best.ckpt --out_dir runs/masked_separator/analysis/mask_structure --num_samples 1000 --split val
