@@ -7,7 +7,7 @@ be compared on equal footing.
 
 Metrics
 -------
-Property (require PropertyScorer / EnsembleRegressor checkpoint):
+Property (require PropertyScorer checkpoint):
     - mu_hat       : predicted activity (mean, median, top-k mean)
     - sigma_hat    : epistemic uncertainty (mean)
     - score        : mu - gamma * sigma (mean, median, top-k mean)
@@ -18,21 +18,28 @@ Diversity & novelty (sequence-level):
     - diversity    : mean pairwise Hamming distance among generated seqs
     - unique_ratio : fraction of unique sequences
 
-Distributional:
-    - kmer_kl      : KL(generated || training) of k-mer frequency spectrum
-    - gc_mean      : mean GC content of generated sequences
-    - gc_std       : std  GC content
-    - gc_kl        : KL(gc_gen || gc_train) discretised to 20 bins
+Distributional (population-level, compare gen vs train distributions):
+    - kmer_kl           : KL(gen || train) of k-mer frequency spectrum
+    - gc_mean/std/kl    : GC-content summary + KL on 20-bin histogram
+    - gc_wasserstein    : 1D Wasserstein on GC-content marginal
+    - mu_wasserstein    : 1D Wasserstein on predicted activity marginal
+                          (requires scorer_ckpt + train_data)
+    - mmd_rbf           : unbiased MMD^2 with RBF kernel in PropertyScorer
+                          penultimate feature space (median bandwidth)
+    - sliced_wasserstein: mean 1D Wasserstein over random projections of
+                          PropertyScorer penultimate features
+                          (geometry-aware, non-parametric)
 
 CLI
 ---
     python -m scripts.evaluate_sequences \
         --generated  runs/guided/guided_sequences.csv \
         --train_data data/gosai_all.csv \
-        --scorer_ckpt runs/ensemble/ensemble_best.ckpt \
+        --scorer_ckpt runs/property_scorer/best.ckpt \
         --out_dir     runs/guided/eval \
-        --k 5         # k for k-mer spectrum \
-        --top_n 100   # top-N for top-k metrics
+        --k 5                # k for k-mer spectrum \
+        --top_n 100          # top-N for top-k metrics \
+        --n_projections 100  # random projections for sliced Wasserstein
 """
 
 import argparse
@@ -80,20 +87,20 @@ def seqs_to_tensor(seqs):
 # ---------------------------------------------------------------------------
 # Property metrics (mu, sigma, score)
 # ---------------------------------------------------------------------------
-def compute_property_metrics(gen_tensor, scorer, gamma: float, top_n: int,
-                             device: torch.device, batch_size: int = 256):
-    from sequence_generation.model.ensemble_regressor import EnsembleRegressor
-
+def score_tensor(tensor, scorer, device, batch_size: int = 256):
+    """Run PropertyScorer over sequences, return (mu, sigma) as numpy arrays."""
     mus, sigmas = [], []
-    for i in range(0, gen_tensor.size(0), batch_size):
-        chunk = gen_tensor[i:i + batch_size].to(device)
-        mu, var = scorer.mu_sigma2({"seqs": chunk})
-        mus.append(mu.squeeze(-1).cpu())
-        sigmas.append(var.clamp_min(1e-12).sqrt().squeeze(-1).cpu())
-    mu = torch.cat(mus, 0).numpy()
-    sigma = torch.cat(sigmas, 0).numpy()
-    score = mu - gamma * sigma
+    with torch.no_grad():
+        for i in range(0, tensor.size(0), batch_size):
+            chunk = tensor[i:i + batch_size].to(device)
+            mu, var = scorer.mu_sigma2({"seqs": chunk})
+            mus.append(mu.squeeze(-1).cpu())
+            sigmas.append(var.clamp_min(1e-12).sqrt().squeeze(-1).cpu())
+    return torch.cat(mus, 0).numpy(), torch.cat(sigmas, 0).numpy()
 
+
+def compute_property_metrics(mu, sigma, gamma: float, top_n: int):
+    score = mu - gamma * sigma
     top_n = min(top_n, len(score))
     top_idx = np.argsort(score)[-top_n:]
 
@@ -197,6 +204,119 @@ def compute_kmer_metrics(gen_seqs, train_seqs, k: int = 5):
 
 
 # ---------------------------------------------------------------------------
+# Feature-space distribution metrics (MMD, Sliced Wasserstein)
+#
+# Rationale: kmer_kl operates on discrete k-mer histograms and ignores
+# sequence geometry (AAAAA and AAAAT are treated as orthogonal bins).
+# MMD and Wasserstein are sample-based two-sample metrics that work in
+# any embedding space — here we use PropertyScorer's penultimate features
+# so that "distance between distributions" reflects activity-relevant
+# geometry rather than raw composition.
+# ---------------------------------------------------------------------------
+def extract_penultimate_features(tensor, scorer, device, batch_size: int = 256,
+                                 member_idx: int = 0):
+    """Capture the input to final_linear from one PropertyScorer member.
+
+    Member 0 is used by default; using one member (vs all) keeps feature
+    dimensionality low and avoids correlated redundancy across members.
+    """
+    member = scorer.members[member_idx]
+    feats = []
+
+    def pre_hook(_module, inputs):
+        feats.append(inputs[0].detach().cpu())
+
+    handle = member.final_linear.register_forward_pre_hook(pre_hook)
+    try:
+        with torch.no_grad():
+            for i in range(0, tensor.size(0), batch_size):
+                chunk = tensor[i:i + batch_size].to(device)
+                _ = member({"seqs": chunk})
+    finally:
+        handle.remove()
+    return torch.cat(feats, 0).numpy()
+
+
+def _sq_dists(A, B):
+    A2 = (A ** 2).sum(axis=1, keepdims=True)
+    B2 = (B ** 2).sum(axis=1, keepdims=True).T
+    return np.maximum(A2 + B2 - 2.0 * A @ B.T, 0.0)
+
+
+def mmd_rbf(X, Y, bandwidth: float = None):
+    """Unbiased MMD^2 with RBF kernel; median heuristic bandwidth if None."""
+    XX = _sq_dists(X, X)
+    YY = _sq_dists(Y, Y)
+    XY = _sq_dists(X, Y)
+
+    if bandwidth is None:
+        nz = XY[XY > 0]
+        bandwidth = float(np.median(np.sqrt(nz))) if nz.size else 1.0
+        bandwidth = max(bandwidth, 1e-6)
+
+    gamma = 1.0 / (2.0 * bandwidth * bandwidth)
+    Kxx = np.exp(-gamma * XX)
+    Kyy = np.exp(-gamma * YY)
+    Kxy = np.exp(-gamma * XY)
+
+    n, m = X.shape[0], Y.shape[0]
+    mmd2 = (
+        (Kxx.sum() - np.trace(Kxx)) / (n * (n - 1))
+        + (Kyy.sum() - np.trace(Kyy)) / (m * (m - 1))
+        - 2.0 * Kxy.sum() / (n * m)
+    )
+    return float(max(mmd2, 0.0)), float(bandwidth)
+
+
+def sliced_wasserstein(X, Y, n_projections: int = 100, seed: int = 0):
+    from scipy.stats import wasserstein_distance
+
+    rng = np.random.default_rng(seed)
+    D = X.shape[1]
+    projs = rng.standard_normal(size=(n_projections, D))
+    projs /= np.linalg.norm(projs, axis=1, keepdims=True) + 1e-12
+
+    X_proj = X @ projs.T
+    Y_proj = Y @ projs.T
+
+    return float(np.mean([
+        wasserstein_distance(X_proj[:, i], Y_proj[:, i])
+        for i in range(n_projections)
+    ]))
+
+
+def compute_feature_distribution_metrics(gen_tensor, train_tensor, scorer, device,
+                                         max_train_feats: int = 5000,
+                                         n_projections: int = 100):
+    gen_feats = extract_penultimate_features(gen_tensor, scorer, device)
+
+    train_sub = train_tensor
+    if train_tensor.size(0) > max_train_feats:
+        idx = np.random.default_rng(0).choice(
+            train_tensor.size(0), size=max_train_feats, replace=False)
+        train_sub = train_tensor[idx]
+    train_feats = extract_penultimate_features(train_sub, scorer, device)
+
+    mmd2, bandwidth = mmd_rbf(gen_feats, train_feats)
+    sw = sliced_wasserstein(gen_feats, train_feats, n_projections=n_projections)
+
+    return {
+        "mmd_rbf": mmd2,
+        "mmd_bandwidth": bandwidth,
+        "sliced_wasserstein": sw,
+        "feature_dim": int(gen_feats.shape[1]),
+        "n_gen_feat": int(gen_feats.shape[0]),
+        "n_train_feat": int(train_feats.shape[0]),
+        "n_projections": n_projections,
+    }
+
+
+def wasserstein_1d(x, y):
+    from scipy.stats import wasserstein_distance
+    return float(wasserstein_distance(np.asarray(x), np.asarray(y)))
+
+
+# ---------------------------------------------------------------------------
 # GC content
 # ---------------------------------------------------------------------------
 def gc_content(seq: str) -> float:
@@ -238,6 +358,10 @@ def main():
     parser.add_argument("--seq_col", type=str, default="seq")
     parser.add_argument("--max_train", type=int, default=10000,
                         help="Cap training seqs for novelty computation")
+    parser.add_argument("--max_train_feats", type=int, default=5000,
+                        help="Cap training seqs for feature-space MMD/Wasserstein")
+    parser.add_argument("--n_projections", type=int, default=100,
+                        help="Random projections for sliced Wasserstein")
     args = parser.parse_args()
 
     print(f"[eval] loading generated sequences from {args.generated}")
@@ -245,12 +369,16 @@ def main():
     print(f"[eval] {len(gen_seqs)} generated sequences loaded")
 
     results = {}
+    scorer = None
+    device = None
+    gen_tensor = None
+    gen_mu = None
 
     # -- Property metrics --
     if args.scorer_ckpt and os.path.exists(args.scorer_ckpt):
-        from sequence_generation.model.ensemble_regressor import EnsembleRegressor
+        from sequence_generation.model.property_scorer import PropertyScorer
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        scorer = EnsembleRegressor(alphabet_size=4)
+        scorer = PropertyScorer(alphabet_size=4)
         sd = torch.load(args.scorer_ckpt, map_location="cpu")
         scorer.load_state_dict(sd.get("model", sd))
         scorer.to(device).eval()
@@ -258,14 +386,14 @@ def main():
             p.requires_grad_(False)
 
         gen_tensor = seqs_to_tensor(gen_seqs)
-        prop = compute_property_metrics(gen_tensor, scorer, args.gamma,
-                                        args.top_n, device)
+        gen_mu, gen_sigma = score_tensor(gen_tensor, scorer, device)
+        prop = compute_property_metrics(gen_mu, gen_sigma, args.gamma, args.top_n)
         results["property"] = prop
         print(f"[eval] property: mu_mean={prop['mu_mean']:.4f}  "
               f"score_mean={prop['score_mean']:.4f}  "
               f"score_top{args.top_n}={prop['score_top_mean']:.4f}")
     else:
-        print("[eval] no scorer checkpoint — skipping property metrics")
+        print("[eval] no scorer checkpoint — skipping property + feature metrics")
 
     # -- Diversity --
     div = compute_diversity(gen_seqs)
@@ -289,12 +417,30 @@ def main():
         print(f"[eval] {args.k}mer_kl={kmer[f'{args.k}mer_kl']:.6f}")
 
         gc = gc_kl(gen_seqs, train_seqs)
+        gc["gc_wasserstein"] = wasserstein_1d(
+            [gc_content(s) for s in gen_seqs],
+            [gc_content(s) for s in train_seqs])
         results["gc"] = gc
-        print(f"[eval] gc_mean={gc['gc_mean']:.4f}  gc_kl={gc['gc_kl']:.6f}")
+        print(f"[eval] gc_mean={gc['gc_mean']:.4f}  gc_kl={gc['gc_kl']:.6f}  "
+              f"gc_wasserstein={gc['gc_wasserstein']:.4f}")
+
+        # -- Feature-space MMD / Sliced Wasserstein --
+        if scorer is not None:
+            train_tensor = seqs_to_tensor(train_seqs)
+            train_mu, _ = score_tensor(train_tensor, scorer, device)
+            feat_dist = compute_feature_distribution_metrics(
+                gen_tensor, train_tensor, scorer, device,
+                max_train_feats=args.max_train_feats,
+                n_projections=args.n_projections)
+            feat_dist["mu_wasserstein"] = wasserstein_1d(gen_mu, train_mu)
+            results["feature_dist"] = feat_dist
+            print(f"[eval] mmd_rbf={feat_dist['mmd_rbf']:.6f}  "
+                  f"sliced_wasserstein={feat_dist['sliced_wasserstein']:.4f}  "
+                  f"mu_wasserstein={feat_dist['mu_wasserstein']:.4f}")
     else:
         gc = gc_kl(gen_seqs, [])
         results["gc"] = {"gc_mean": gc["gc_mean"], "gc_std": gc["gc_std"]}
-        print(f"[eval] gc_mean={gc['gc_mean']:.4f}  (no train data for kmer/novelty)")
+        print(f"[eval] gc_mean={gc['gc_mean']:.4f}  (no train data for kmer/novelty/feature)")
 
     # -- Save --
     if args.out_dir:
