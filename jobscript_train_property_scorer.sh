@@ -23,7 +23,6 @@ output_dir="/lustre/scratch126/cellgen/lotfollahi/dj16/projects/sequence_generat
 ENV_PATH="/nfs/team361/dj16/pypoetry/virtualenvs/sequence-generation-7Ds7Y9Ey-py3.12/bin/activate"
 
 [ -f $ENV_PATH ] && source $ENV_PATH || echo "Failed to activate: ${ENV_PATH}"
-기
 
 # === Training ===
 # # Without DDP
