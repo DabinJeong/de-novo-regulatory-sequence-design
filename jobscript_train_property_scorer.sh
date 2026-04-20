@@ -1,8 +1,8 @@
-#BSUB -J train-sequence_generation
+#BSUB -J train-sequence_property_scorer
 #BSUB -G team361
 #BSUB -L /usr/bin/bash
-#BSUB -o train-sequence_generation.%J.out
-#BSUB -e train-sequence_generation.%J.err
+#BSUB -o train-sequence_property_scorer.%J.out
+#BSUB -e train-sequence_property_scorer.%J.err
 #BSUB -q training-parallel
 #BSUB -gpu "mode=shared:j_exclusive=no:gmem=76GB:num=1"
 #BSUB -n 16
@@ -23,14 +23,19 @@ output_dir="/lustre/scratch126/cellgen/lotfollahi/dj16/projects/sequence_generat
 ENV_PATH="/nfs/team361/dj16/pypoetry/virtualenvs/sequence-generation-7Ds7Y9Ey-py3.12/bin/activate"
 
 [ -f $ENV_PATH ] && source $ENV_PATH || echo "Failed to activate: ${ENV_PATH}"
-
+기
 
 # === Training ===
 # # Without DDP
-# python -u -m scripts.main --train --config ${run_dir}/configs/enhancer_gosai_masked_separator.yaml --out_dir ${output_dir}/sequence_generation_${LSB_JOBID}
+python -u -m scripts.main --train --config ${run_dir}/configs/enhancer_gosai_masked_separator.yaml --out_dir ${output_dir}/sequence_generation_${LSB_JOBID}
 
 # With DDP
 # torchrun --standalone --nproc_per_node 2 -m scripts.main --train --config ${run_dir}/configs/enhancer_gosai.yaml --out_dir ${output_dir}/sequence_generation_${LSB_JOBID}
+
+# === Train ensemble for guided generation === 
+if [ ! -f ./runs/ensemble/ensemble_best.ckpt ];then
+    python -m scripts.main_guided --config configs/enhancer_gosai_guided.yaml --out_dir ./runs/ensemble --train_ensemble
+fi
 
 # === Analyze seq contents of invariant/env subsequeces ===
 python -m scripts.analyze_invariant_separator --config configs/enhancer_gosai_masked_separator.yaml --ckpt runs/masked_separator/masked_separator_best.ckpt --out_dir runs/masked_separator/analysis --num_samples 4000 --split val
