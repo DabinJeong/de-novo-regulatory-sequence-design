@@ -31,6 +31,16 @@ loader:
   num_workers: 4
   pin_memory: True
 
+# ---------- GIL-style masked separator (trained via masked_separator_trainer) ----------
+# Provides the reference mask M_ref used by the guided sampler for bounded
+# guidance. Architectural fields (target_idx, num_envs, init_rho) must match
+# the values used during training so MaskedSeparatorModel loads the checkpoint.
+masked_separator:
+  checkpoint_path: ./runs/masked_separator/masked_separator_best.ckpt
+  target_idx: null    # null -> regress on mean(hepg2, k562, sknsh)
+  num_envs: 3         # K for K-means env inference (architectural)
+  init_rho: 0.3       # target stable ratio used at init
+
 # ---------- ensemble property predictor (mu_hat, sigma2_hat) ----------
 ensemble:
   num_members: 5
