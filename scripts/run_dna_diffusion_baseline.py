@@ -55,8 +55,12 @@ def load_dna_diffusion(dd_cfg, device: torch.device):
             "Clone https://github.com/pinellolab/DNA-Diffusion and set "
             "dna_diffusion.repo_path."
         )
-    src_path = os.path.join(repo_path, "src")
-    sys.path.insert(0, src_path)
+    # DNA-Diffusion's hydra configs reference targets as `src.dnadiffusion....`,
+    # so the *repo root* (parent of src/) must be on sys.path for `src` to
+    # resolve as a package. Also keep src/ itself for any `dnadiffusion.*`
+    # imports used internally.
+    sys.path.insert(0, repo_path)
+    sys.path.insert(0, os.path.join(repo_path, "src"))
     cwd_backup = os.getcwd()
     os.chdir(repo_path)
     try:
