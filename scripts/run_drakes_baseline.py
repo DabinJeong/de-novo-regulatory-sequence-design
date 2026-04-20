@@ -21,7 +21,8 @@ Prerequisites
 -------------
 - A checkout of https://github.com/ChenyuWang-Monica/DRAKES on disk, plus
   their Dropbox data+weights zip extracted to `drakes.base_path`.
-- Our PropertyScorer checkpoint (train via property_trainer).
+- Our PropertyScorer checkpoint (train via scripts.main_guided --train_ensemble,
+  which invokes scripts.ensemble_trainer).
 
 CLI
 ---
