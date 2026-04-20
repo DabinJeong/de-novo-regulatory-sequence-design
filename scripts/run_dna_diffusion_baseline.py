@@ -136,7 +136,12 @@ def sample_dna_diffusion(diffusion, data, cell_types, num_samples: int,
                 classes, (batch_size, 1, 4, seq_length), guidance_scale,
             )
             final = sampled[-1] if isinstance(sampled, (list, tuple)) else sampled
-            final = final.detach().cpu().numpy()
+            # DNA-Diffusion's sample() can return a tensor or a numpy array
+            # depending on the code path; handle both.
+            if torch.is_tensor(final):
+                final = final.detach().cpu().numpy()
+            else:
+                final = np.asarray(final)
             # (B, 1, 4, L) or (B, 4, L) -> argmax along nucleotide axis
             if final.ndim == 4:
                 final = final[:, 0]
