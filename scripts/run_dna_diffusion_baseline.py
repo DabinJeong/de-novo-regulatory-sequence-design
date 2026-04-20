@@ -90,10 +90,16 @@ def load_dna_diffusion(dd_cfg, device: torch.device):
         ckpt = dd_cfg.checkpoint_path
         if ckpt.endswith(".safetensors"):
             sd = load_file(ckpt) if device.type == "cuda" else load_file(ckpt, device="cpu")
-            diffusion.model.load_state_dict(sd)
         else:
             sd = torch.load(ckpt, map_location=device)
-            diffusion.model.load_state_dict(sd["model"] if "model" in sd else sd)
+            sd = sd.get("state_dict", sd.get("model", sd))
+
+        # DNA-Diffusion checkpoints are saved from the Diffusion wrapper, which
+        # holds the UNet as `self.model`. Strip the "model." prefix so keys
+        # align with the inner UNet we're loading into.
+        if sd and all(k.startswith("model.") for k in sd.keys()):
+            sd = {k[len("model."):]: v for k, v in sd.items()}
+        diffusion.model.load_state_dict(sd)
 
         diffusion = diffusion.to(device)
         diffusion.eval()
