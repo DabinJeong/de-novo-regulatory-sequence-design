@@ -61,13 +61,19 @@ def load_dna_diffusion(dd_cfg, device: torch.device):
     os.chdir(repo_path)
     try:
         import hydra
-        from hydra import compose, initialize
+        from hydra import compose, initialize_config_dir
         from hydra.core.global_hydra import GlobalHydra
         from safetensors.torch import load_file
 
+        # initialize() resolves config_path relative to the *calling file*, not
+        # cwd, so we use initialize_config_dir with an absolute path inside the
+        # DNA-Diffusion checkout.
+        cfg_dir = os.path.abspath(
+            os.path.join(repo_path, dd_cfg.get("hydra_config_dir", "configs"))
+        )
         GlobalHydra.instance().clear()
-        initialize(
-            config_path=dd_cfg.get("hydra_config_dir", "configs"),
+        initialize_config_dir(
+            config_dir=cfg_dir,
             job_name="dna_diffusion_baseline",
             version_base=None,
         )
