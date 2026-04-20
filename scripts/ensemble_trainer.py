@@ -1,8 +1,17 @@
 """
-Trainer for the PropertyScorer (proposal: slide 14-15).
+Ensemble trainer for the PropertyScorer (proposal: slide 14-15).
 
-Trains K independent SeqRegressor members with different seeds and saves a
-single checkpoint that GuidedSampler can load.
+Trains K independent SeqRegressor members with different seeds; member-wise
+variance at inference yields the epistemic-uncertainty signal used as a
+brake on property guidance. Saves a single checkpoint that the guided
+sampler and baseline scripts load.
+
+This is *not* the masked-separator trainer -- see
+scripts/separator_trainer.py for that.
+
+Usage:
+    python -m scripts.main_guided --config configs/enhancer_gosai_guided.yaml \
+                                  --out_dir ./runs/ensemble --train_ensemble
 """
 
 import os

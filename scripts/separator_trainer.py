@@ -1,18 +1,23 @@
 """
-Joint property predictor + masked separator trainer.
+Masked separator + y_head joint trainer.
 
-Trains a MaskedSeparatorModel (mask separator + y_head) so that:
+Trains a MaskedSeparatorModel so that:
   - y_head predicts activity from the invariant sub-sequence x_st
   - The separator learns which positions are functional (x_st) vs background (x_en)
   - V-REx invariance penalty ensures x_st predictions are robust across
     inferred environments (derived from x_en via K-means)
+
+This supplies the reference mask M_ref used by the guided sampler for
+bounded guidance. It is *not* the ensemble property scorer used for
+uncertainty-aware activity guidance -- see scripts/ensemble_trainer.py
+for that.
 
 Loss:
     L = L_sta + lambda_reg * L_reg + beta_inv * L_inv
 
 Usage:
     python -m scripts.main --config configs/enhancer_gosai.yaml \
-                           --out_dir ./runs/property --train
+                           --out_dir ./runs/separator --train
 """
 
 import os

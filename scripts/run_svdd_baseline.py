@@ -26,7 +26,8 @@ Prerequisites
 - A checkout of https://github.com/masa-ue/SVDD on disk, containing
   `diffusion_gosai.py`, `oracle.py`, `configs_gosai/`, `models/`, etc.
 - SVDD's pretrained MDLM Gosai checkpoint (distributed with the repo).
-- Our PropertyScorer checkpoint (train via property_trainer).
+- Our PropertyScorer checkpoint (train via scripts.main_guided --train_ensemble,
+  which invokes scripts.ensemble_trainer).
 
 CLI
 ---
