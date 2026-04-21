@@ -151,8 +151,12 @@ def load_independent_oracle(ckpt_path: str, device):
     """Load the DRAKES-distributed grelu LightningModel used as external oracle.
 
     The checkpoint was saved via grelu's LightningModel wrapper around
-    EnformerPretrainedModel (3-task regression: hepg2, k562, sknsh).
+    EnformerPretrainedModel (3-task regression: hepg2, k562, sknsh). DRAKES'
+    ckpt predates grelu's data_params-at-top-level migration, so we patch
+    on_load_checkpoint before Lightning calls it.
     """
+    from sequence_generation.utils.grelu_compat import patch_grelu_lightning_compat
+    patch_grelu_lightning_compat()
     from grelu.lightning import LightningModel
     model = LightningModel.load_from_checkpoint(ckpt_path, map_location=device)
     model.to(device).eval()
