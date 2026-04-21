@@ -62,7 +62,9 @@ sampling:
   ood_lambda:        0.0     # 0 = in-distribution, ->1 = novelty / OOD push
   gamma_rank:        1.0     # ranking: -gamma * sigma_hat
   delta_rank:        0.0     # ranking: +delta * novelty(x)
-  num_sample_batches: 2
+  # 20 * eval_batch_size (32) = 640 samples, matching DRAKES / SVDD / DNA-Diffusion.
+  # Currently informational; guided_sampler.py reads --num_batches from CLI.
+  num_sample_batches: 20
 
 train:
   num_epochs: 5
