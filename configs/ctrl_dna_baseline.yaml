@@ -2,44 +2,54 @@ name: ctrl_dna_baseline
 seed: 42
 
 # ---------------------------------------------------------------------------
-# Baseline: Ctrl-DNA (Li et al., "Ctrl-DNA: Controllable Cell-Type-Specific
-# Regulatory DNA Design via Constrained RL", 2025).
-# https://github.com/xinyuli1204/Ctrl-DNA
+# Baseline: regLM pretrained + cell-type prefix, standing in for Ctrl-DNA.
 #
-# Ctrl-DNA fine-tunes a pretrained regLM (Lal et al., "regLM: Designing
-# Realistic Regulatory DNA with Autoregressive Language Models", 2024)
-# with REINFORCE under a Lagrangian constraint so that the sampled
-# sequences maximise on-cell-type activity while keeping off-cell-type
-# activity below a budget.
+# Ctrl-DNA (Li et al., "Ctrl-DNA: Controllable Cell-Type-Specific Regulatory
+# DNA Design via Constrained RL", 2025, https://github.com/xinyuli1204/Ctrl-DNA)
+# fine-tunes a pretrained regLM (Lal et al., "regLM: Designing Realistic
+# Regulatory DNA with Autoregressive Language Models", 2024) with
+# REINFORCE under a Lagrangian constraint so that the sampled sequences
+# maximise on-cell-type activity while keeping off-cell-type activity
+# below a budget.
 #
-# This wrapper assumes the user has already trained a Ctrl-DNA agent for
-# a given cell type with the upstream repo's training scripts
-# (typically `reinforce_lagrange_enhancers.sh`). We then:
-#   1. load the trained regLM agent checkpoint,
-#   2. sample N sequences conditioned on a cell-type label prefix,
-#   3. score them with **our** EnsembleRegressor,
-#   4. write CSV with columns `seq, mu, sigma, score` matching our other
+# Running the actual Ctrl-DNA RL fine-tune is out of scope here (it
+# requires training the Lagrange optimiser end-to-end for each target
+# cell type). This config instead runs the **base policy** that Ctrl-DNA
+# starts from: the pretrained regLM model conditioned on a cell-type
+# label prefix. This isolates what the Ctrl-DNA RL step actually adds on
+# top of the regLM prior, and in our setup it is the closest faithful
+# baseline we can run without redoing the authors' RL training.
+#
+# The runner:
+#   1. loads the pretrained regLM LightningModel from disk,
+#   2. samples N sequences conditioned on a cell-type label prefix,
+#   3. scores them with our PropertyScorer,
+#   4. writes CSV with columns `seq, mu, sigma, score` matching our other
 #      baseline runners.
 # ---------------------------------------------------------------------------
 
 ctrl_dna:
   # Absolute path to a checkout of https://github.com/xinyuli1204/Ctrl-DNA
-  # (contains the regLM-style Lightning agent and training scripts).
+  # (contains a vendored copy of regLM under `ctrl_dna/src/reglm/`).
   repo_path: /nfs/team361/dj16/projects/sequence_generation_baselines/Ctrl-DNA
 
-  # Trained Ctrl-DNA agent checkpoint produced by the upstream repo's
-  # training scripts (e.g. `reinforce_lagrange_enhancers.sh`).
-  checkpoint_path: /path/to/ctrl_dna/agent_best.ckpt
+  # Pretrained regLM LightningModel checkpoint (Lal et al. 2024). We load
+  # this via `src.reglm.lightning.LightningModel.load_from_checkpoint`.
+  # Leaving this empty gives random label embeddings and no meaningful
+  # cell-type conditioning, so the runner refuses to start without it.
+  checkpoint_path: /path/to/reglm/enhancer_pretrained.ckpt
 
-  # Cell-type prefix token(s) prepended to the regLM prompt at sampling
-  # time. Ctrl-DNA follows regLM's convention of using per-activity bucket
-  # tokens; use whatever label the trained agent was conditioned on.
-  cell_type_prefix: "HEPG2_HIGH"
+  # Cell-type label prefix. regLM's Gosai enhancer task uses a 3-char
+  # binary string: "100" -> HepG2, "010" -> K562, "001" -> SK-N-SH.
+  # Length must match the loaded model's `label_len`.
+  cell_type_prefix: "100"
 
-  # Temperature for nucleus sampling (regLM default is 1.0).
+  # Temperature / nucleus sampling knobs passed straight through to
+  # `LightningModel.generate`. regLM defaults: temperature=1.0, top_k=None,
+  # top_p=None (i.e. unbiased sampling from the learned distribution).
   temperature: 1.0
-  top_k: 0 # 0 -> disabled
-  top_p: 1.0 # 1.0 -> disabled
+  top_k: 0   # 0 -> disabled (passed as None)
+  top_p: 1.0 # 1.0 -> disabled (passed as None)
 
 # ---------------------------------------------------------------------------
 # Our ensemble regressor for scoring (mu, sigma) — same model used by
@@ -55,8 +65,10 @@ ensemble:
 model:
   alphabet_size: 4 # A,C,G,T
 
+# 20 batches x 32 = 640 sequences, matching guided_sampler / DRAKES / SVDD
+# / DNA-Diffusion so eval metrics are comparable across methods.
 sampling:
-  num_batches: 10
-  batch_size: 64
+  num_batches: 20
+  batch_size: 32
   seq_length: 200 # Gosai enhancer length
   gamma_rank: 1.0 # score = mu - gamma_rank * sigma
