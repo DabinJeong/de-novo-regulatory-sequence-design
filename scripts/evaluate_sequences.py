@@ -161,6 +161,11 @@ def load_independent_oracle(ckpt_path: str, device):
     The checkpoint was saved via grelu's LightningModel wrapper around
     EnformerPretrainedModel (3-task regression: hepg2, k562, sknsh).
     """
+    # DRAKES' ckpt nests data_params/model_params/train_params inside
+    # hyper_parameters, but newer grelu expects them at the top level and
+    # also reads `performance` directly. Patch before the import.
+    from sequence_generation.utils.grelu_compat import patch_grelu_lightning_compat
+    patch_grelu_lightning_compat()
     from grelu.lightning import LightningModel
     model = LightningModel.load_from_checkpoint(ckpt_path, map_location=device)
     model.to(device).eval()

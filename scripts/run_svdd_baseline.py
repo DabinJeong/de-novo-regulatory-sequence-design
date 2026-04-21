@@ -69,6 +69,10 @@ def load_svdd_model(svdd_cfg, device: torch.device):
     try:
         from hydra import compose, initialize_config_dir  # noqa: WPS433 (lazy import)
         from hydra.core.global_hydra import GlobalHydra
+        # SVDD's oracle module loads a DRAKES-era grelu checkpoint whose
+        # hyper_parameters layout newer grelu rejects. Patch before import.
+        from sequence_generation.utils.grelu_compat import patch_grelu_lightning_compat
+        patch_grelu_lightning_compat()
         import diffusion_gosai as diffusion_mod
         import oracle as oracle_mod
 
