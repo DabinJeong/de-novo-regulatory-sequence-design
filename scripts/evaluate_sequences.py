@@ -26,6 +26,8 @@ Diversity & novelty (sequence-level):
 
 Distributional (population-level, compare gen vs train distributions):
     - kmer_kl           : KL(gen || train) of k-mer frequency spectrum
+    - kmer_pearson      : Pearson correlation of k-mer frequency vectors
+                          (DRAKES Table 1 reports this at k=3)
     - gc_mean/std/kl    : GC-content summary + KL on 20-bin histogram
     - gc_wasserstein    : 1D Wasserstein on GC-content marginal
     - mu_wasserstein    : 1D Wasserstein on predicted activity marginal
@@ -35,6 +37,12 @@ Distributional (population-level, compare gen vs train distributions):
     - sliced_wasserstein: mean 1D Wasserstein over random projections of
                           PropertyScorer penultimate features
                           (geometry-aware, non-parametric)
+
+JASPAR motif (require --jaspar; needs pyjaspar + biopython):
+    - motif_hits_per_seq_mean / median : PSSM hits per sequence at FPR=1e-3
+    - motif_coverage                   : fraction of seqs with at least one hit
+    - motif_freq_pearson               : Pearson correlation between gen and
+                                         train per-motif hit rates
 
 CLI
 ---
@@ -273,14 +281,150 @@ def kl_divergence(p_freq, q_freq, pseudocount: float = 1e-8):
     return float(kl)
 
 
-def compute_kmer_metrics(gen_seqs, train_seqs, k: int = 5):
+def kmer_pearson(p_freq, q_freq):
+    """Pearson correlation between two k-mer frequency dicts.
+
+    Aligned over the union of keys (missing k-mers get frequency 0). Returns
+    NaN when either side has zero variance (e.g. all-N inputs). DRAKES'
+    "3-mer Pearson" metric uses this form over global frequency vectors.
+    """
+    all_kmers = sorted(set(p_freq) | set(q_freq))
+    if not all_kmers:
+        return float("nan")
+    p_vec = np.array([p_freq.get(k, 0.0) for k in all_kmers])
+    q_vec = np.array([q_freq.get(k, 0.0) for k in all_kmers])
+    if p_vec.std() == 0 or q_vec.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(p_vec, q_vec)[0, 1])
+
+
+def compute_kmer_metrics(gen_seqs, train_seqs, k: int = 5,
+                         pearson_ks=(3,)):
     gen_freq = kmer_frequencies(gen_seqs, k)
     train_freq = kmer_frequencies(train_seqs, k)
-    return {
+    metrics = {
         f"{k}mer_kl": kl_divergence(gen_freq, train_freq),
+        f"{k}mer_pearson": kmer_pearson(gen_freq, train_freq),
         f"{k}mer_unique_gen": len(gen_freq),
         f"{k}mer_unique_train": len(train_freq),
     }
+    # DRAKES' Table 1 reports 3-mer Pearson regardless of the k used for KL,
+    # so always compute it (unless already covered by k) for direct comparison.
+    for k_extra in pearson_ks:
+        if k_extra == k:
+            continue
+        g = kmer_frequencies(gen_seqs, k_extra)
+        t = kmer_frequencies(train_seqs, k_extra)
+        metrics[f"{k_extra}mer_pearson"] = kmer_pearson(g, t)
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# JASPAR motif scanning
+#
+# Loads vertebrate core PWMs via pyjaspar, builds biopython PSSMs, scans each
+# sequence on both strands at a fixed FPR threshold, and reports:
+#   - motif_hits_per_seq_mean/median : hit density per sequence
+#   - motif_coverage                 : fraction of seqs with >=1 hit
+#   - motif_freq_pearson             : Pearson corr. between gen and train
+#                                      motif-frequency vectors (one entry
+#                                      per motif), analogous to k-mer Pearson
+# ---------------------------------------------------------------------------
+def _load_jaspar_pssms(release: str, collection: str, tax_group: str,
+                       pseudocount: float, max_motifs: int = None):
+    """Return list of (motif_id, biopython PSSM) pairs."""
+    from pyjaspar import jaspardb
+    jdb = jaspardb(release=release)
+    kwargs = {"collection": collection}
+    if tax_group:
+        kwargs["tax_group"] = [tax_group]
+    motifs = jdb.fetch_motifs(**kwargs)
+    if max_motifs is not None:
+        motifs = motifs[:max_motifs]
+
+    pssms = []
+    for m in motifs:
+        pwm = m.counts.normalize(pseudocounts=pseudocount)
+        pssm = pwm.log_odds()
+        pssms.append((m.matrix_id, pssm))
+    return pssms
+
+
+def _pssm_thresholds(pssms, background, fpr: float):
+    """Compute per-motif score threshold at the given false-positive rate."""
+    thresholds = []
+    for _, pssm in pssms:
+        dist = pssm.distribution(background=background, precision=10**3)
+        thresholds.append(dist.threshold_fpr(fpr))
+    return thresholds
+
+
+def scan_jaspar_motifs(seqs, release: str = "JASPAR2022",
+                       collection: str = "CORE",
+                       tax_group: str = "vertebrates",
+                       fpr: float = 1e-3, pseudocount: float = 0.5,
+                       max_motifs: int = None):
+    """Scan each sequence on both strands against JASPAR PSSMs.
+
+    Returns:
+        hits_per_seq : (N,) int — total hit count per sequence (any motif)
+        motif_freq   : (M,) float — per-motif hit rate averaged over sequences
+        motif_ids    : list[str] of length M
+    """
+    from Bio.Seq import Seq
+
+    pssms = _load_jaspar_pssms(release, collection, tax_group,
+                               pseudocount, max_motifs)
+    background = {"A": 0.25, "C": 0.25, "G": 0.25, "T": 0.25}
+    thresholds = _pssm_thresholds(pssms, background, fpr)
+
+    N, M = len(seqs), len(pssms)
+    hits_per_seq = np.zeros(N, dtype=np.int64)
+    motif_hits = np.zeros(M, dtype=np.int64)
+
+    for i, s in enumerate(seqs):
+        bseq = Seq(s)
+        for j, (_, pssm) in enumerate(pssms):
+            # `both=True` scans reverse-complement too — regulatory motifs
+            # can bind either strand at enhancer elements.
+            count = sum(1 for _ in pssm.search(bseq, threshold=thresholds[j],
+                                               both=True))
+            hits_per_seq[i] += count
+            motif_hits[j] += count
+
+    motif_freq = motif_hits.astype(np.float64) / max(N, 1)
+    return hits_per_seq, motif_freq, [mid for mid, _ in pssms]
+
+
+def compute_jaspar_metrics(gen_seqs, train_seqs=None, release: str = "JASPAR2022",
+                           collection: str = "CORE",
+                           tax_group: str = "vertebrates",
+                           fpr: float = 1e-3, max_motifs: int = None):
+    gen_hits, gen_freq, motif_ids = scan_jaspar_motifs(
+        gen_seqs, release=release, collection=collection,
+        tax_group=tax_group, fpr=fpr, max_motifs=max_motifs)
+
+    metrics = {
+        "motif_hits_per_seq_mean": float(gen_hits.mean()),
+        "motif_hits_per_seq_median": float(np.median(gen_hits)),
+        "motif_coverage": float((gen_hits > 0).mean()),
+        "num_motifs": len(motif_ids),
+        "fpr_threshold": fpr,
+        "release": release,
+        "collection": collection,
+    }
+    if train_seqs:
+        _, train_freq, _ = scan_jaspar_motifs(
+            train_seqs, release=release, collection=collection,
+            tax_group=tax_group, fpr=fpr, max_motifs=max_motifs)
+        # Pearson between per-motif hit rates: does the generated distribution
+        # over motifs look like the training distribution?
+        if gen_freq.std() > 0 and train_freq.std() > 0:
+            metrics["motif_freq_pearson"] = float(
+                np.corrcoef(gen_freq, train_freq)[0, 1])
+        else:
+            metrics["motif_freq_pearson"] = float("nan")
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +598,20 @@ def main():
                         help="Which of the oracle's 3 heads to report "
                              "(0=hepg2, 1=k562, 2=sknsh). Default 0.")
     parser.add_argument("--oracle_batch_size", type=int, default=128)
+    parser.add_argument("--jaspar", action="store_true",
+                        help="Enable JASPAR motif scanning metrics. Requires "
+                             "pyjaspar and biopython.")
+    parser.add_argument("--jaspar_release", type=str, default="JASPAR2022")
+    parser.add_argument("--jaspar_collection", type=str, default="CORE")
+    parser.add_argument("--jaspar_tax_group", type=str, default="vertebrates")
+    parser.add_argument("--jaspar_fpr", type=float, default=1e-3,
+                        help="Per-PSSM false-positive rate for hit threshold.")
+    parser.add_argument("--jaspar_max_motifs", type=int, default=None,
+                        help="Cap the number of JASPAR motifs scanned (useful "
+                             "for smoke tests; unset = scan all).")
+    parser.add_argument("--jaspar_max_train", type=int, default=2000,
+                        help="Cap training seqs for JASPAR scan (scanning all "
+                             "of gosai_all.csv on 700 motifs is costly).")
     args = parser.parse_args()
 
     print(f"[eval] loading generated sequences from {args.generated}")
@@ -537,7 +695,11 @@ def main():
 
         kmer = compute_kmer_metrics(gen_seqs, train_seqs, k=args.k)
         results["kmer"] = kmer
-        print(f"[eval] {args.k}mer_kl={kmer[f'{args.k}mer_kl']:.6f}")
+        msg = (f"[eval] {args.k}mer_kl={kmer[f'{args.k}mer_kl']:.6f}  "
+               f"{args.k}mer_pearson={kmer[f'{args.k}mer_pearson']:.4f}")
+        if "3mer_pearson" in kmer and args.k != 3:
+            msg += f"  3mer_pearson={kmer['3mer_pearson']:.4f}"
+        print(msg)
 
         gc = gc_kl(gen_seqs, train_seqs)
         gc["gc_wasserstein"] = wasserstein_1d(
@@ -546,6 +708,27 @@ def main():
         results["gc"] = gc
         print(f"[eval] gc_mean={gc['gc_mean']:.4f}  gc_kl={gc['gc_kl']:.6f}  "
               f"gc_wasserstein={gc['gc_wasserstein']:.4f}")
+
+        # -- JASPAR motif --
+        if args.jaspar:
+            print(f"[eval] scanning JASPAR {args.jaspar_release}/"
+                  f"{args.jaspar_collection}/{args.jaspar_tax_group} "
+                  f"at FPR={args.jaspar_fpr}")
+            train_sub = train_seqs[:args.jaspar_max_train]
+            jmetrics = compute_jaspar_metrics(
+                gen_seqs, train_sub,
+                release=args.jaspar_release,
+                collection=args.jaspar_collection,
+                tax_group=args.jaspar_tax_group,
+                fpr=args.jaspar_fpr,
+                max_motifs=args.jaspar_max_motifs)
+            results["jaspar"] = jmetrics
+            msg = (f"[eval] motif_hits/seq={jmetrics['motif_hits_per_seq_mean']:.2f}  "
+                   f"coverage={jmetrics['motif_coverage']:.3f}  "
+                   f"motifs={jmetrics['num_motifs']}")
+            if "motif_freq_pearson" in jmetrics:
+                msg += f"  motif_freq_pearson={jmetrics['motif_freq_pearson']:.4f}"
+            print(msg)
 
         # -- Feature-space MMD / Sliced Wasserstein --
         if scorer is not None:
@@ -564,6 +747,20 @@ def main():
         gc = gc_kl(gen_seqs, [])
         results["gc"] = {"gc_mean": gc["gc_mean"], "gc_std": gc["gc_std"]}
         print(f"[eval] gc_mean={gc['gc_mean']:.4f}  (no train data for kmer/novelty/feature)")
+
+        if args.jaspar:
+            print(f"[eval] scanning JASPAR (gen-only, no train reference)")
+            jmetrics = compute_jaspar_metrics(
+                gen_seqs, None,
+                release=args.jaspar_release,
+                collection=args.jaspar_collection,
+                tax_group=args.jaspar_tax_group,
+                fpr=args.jaspar_fpr,
+                max_motifs=args.jaspar_max_motifs)
+            results["jaspar"] = jmetrics
+            print(f"[eval] motif_hits/seq={jmetrics['motif_hits_per_seq_mean']:.2f}  "
+                  f"coverage={jmetrics['motif_coverage']:.3f}  "
+                  f"motifs={jmetrics['num_motifs']}")
 
     # -- Save --
     if args.out_dir:
