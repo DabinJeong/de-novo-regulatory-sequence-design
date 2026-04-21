@@ -33,7 +33,20 @@ python -m scripts.run_dna_diffusion_baseline --config configs/dna_diffusion_base
 # python -m scripts.run_guided_sampling --config configs/guided_sampling.yaml --out_dir ./runs/guided
 
 # === Evaluate baselines ===
-for csv in runs/drakes_baseline/drakes_sequences.csv runs/svdd_baseline/svdd_sequences.csv runs/dna_diffusion_baseline/dna_diffusion_sequences.csv runs/guided/guided_sequences.csv; do                                                                                                                                          
+ORACLE_CKPT=/nfs/team361/dj16/projects/sequence_generation_baselines/DRAKES_data/data_and_model/mdlm/outputs_gosai/lightning_logs/reward_oracle_eval.ckpt
+TRAIN=/lustre/scratch126/cellgen/lotfollahi/dj16/data/sequence_data/enhancer_gosai_DRAKES/processed_data/gosai_all.csv
+
+for csv in runs/drakes_baseline/drakes_sequences.csv \
+           runs/svdd_baseline/svdd_sequences.csv \
+           runs/dna_diffusion_baseline/dna_diffusion_sequences.csv \
+           runs/guided/bounded/guided_sequences.csv; do
     out=$(dirname $csv)/eval
-    python -m scripts.evaluate_sequences --generated $csv --train_data data/gosai_all.csv --scorer_ckpt runs/ensemble/ensemble_best.ckpt  --out_dir $out                                      
-  done           
+    python -m scripts.evaluate_sequences \
+      --generated $csv \
+      --train_data $TRAIN \
+      --scorer_ckpt runs/ensemble/ensemble_best.ckpt \
+      --oracle_ckpt $ORACLE_CKPT \
+      --oracle_target_idx 0 \
+      --jaspar \
+      --out_dir $out
+done
