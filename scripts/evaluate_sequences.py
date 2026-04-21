@@ -12,6 +12,12 @@ Property (require PropertyScorer checkpoint):
     - sigma_hat    : epistemic uncertainty (mean)
     - score        : mu - gamma * sigma (mean, median, top-k mean)
 
+Independent oracle (require --oracle_ckpt):
+    - independent_mu : predicted activity from a separately-trained regressor
+                       (DRAKES reward_oracle_eval.ckpt, grelu Enformer, 3-task).
+                       Breaks the guidance/evaluation circularity of using our
+                       own PropertyScorer for both steering and scoring.
+
 Diversity & novelty (sequence-level):
     - novelty      : min Hamming distance from each generated seq to
                      the closest training sequence (mean, median)
@@ -36,6 +42,8 @@ CLI
         --generated  runs/guided/guided_sequences.csv \
         --train_data data/gosai_all.csv \
         --scorer_ckpt runs/property_scorer/best.ckpt \
+        --oracle_ckpt DRAKES_data/.../reward_oracle_eval.ckpt \
+        --oracle_target_idx 0 \
         --out_dir     runs/guided/eval \
         --k 5                # k for k-mer spectrum \
         --top_n 100          # top-N for top-k metrics \
@@ -134,6 +142,58 @@ def compute_property_metrics(mu, sigma, gamma: float, top_n: int):
         "score_median": float(np.median(score)),
         "score_top_mean": float(score[top_idx].mean()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Independent oracle (DRAKES-distributed reward_oracle_eval.ckpt, grelu-based)
+# ---------------------------------------------------------------------------
+def load_independent_oracle(ckpt_path: str, device):
+    """Load the DRAKES-distributed grelu LightningModel used as external oracle.
+
+    The checkpoint was saved via grelu's LightningModel wrapper around
+    EnformerPretrainedModel (3-task regression: hepg2, k562, sknsh).
+    """
+    from grelu.lightning import LightningModel
+    model = LightningModel.load_from_checkpoint(ckpt_path, map_location=device)
+    model.to(device).eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+
+
+def _seqs_to_onehot(tensor: torch.Tensor) -> torch.Tensor:
+    """(B, L) int -> (B, 4, L) float one-hot, the layout grelu models expect."""
+    return torch.nn.functional.one_hot(tensor, num_classes=4).permute(0, 2, 1).float()
+
+
+def score_with_oracle(tensor: torch.Tensor, oracle, device, target_idx: int,
+                      batch_size: int = 128) -> np.ndarray:
+    """Run the independent oracle over (B, L) token IDs and return (N,) predictions
+    for the requested target_idx column (0=hepg2, 1=k562, 2=sknsh)."""
+    preds = []
+    with torch.no_grad():
+        for i in range(0, tensor.size(0), batch_size):
+            chunk = _seqs_to_onehot(tensor[i:i + batch_size].to(device))
+            out = oracle(chunk)
+            if out.dim() == 3:
+                out = out.mean(dim=-1)
+            preds.append(out[:, target_idx].detach().cpu())
+    return torch.cat(preds, 0).numpy()
+
+
+def compute_independent_oracle_metrics(mu_indep: np.ndarray, top_n: int,
+                                       mu_ours: np.ndarray = None):
+    top_n = min(top_n, len(mu_indep))
+    top_idx = np.argsort(mu_indep)[-top_n:]
+    metrics = {
+        "independent_mu_mean": float(mu_indep.mean()),
+        "independent_mu_median": float(np.median(mu_indep)),
+        "independent_mu_top_mean": float(mu_indep[top_idx].mean()),
+    }
+    if mu_ours is not None and len(mu_ours) == len(mu_indep):
+        corr = float(np.corrcoef(mu_indep, mu_ours)[0, 1])
+        metrics["pearson_vs_ours"] = corr
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +447,13 @@ def main():
                              "column contains this string (case-insensitive). "
                              "Useful for filtering DNA-Diffusion's per-cell-type "
                              "output down to e.g. HepG2 only.")
+    parser.add_argument("--oracle_ckpt", type=str, default=None,
+                        help="Path to DRAKES-distributed reward_oracle_eval.ckpt "
+                             "(grelu Enformer). Enables independent oracle metrics.")
+    parser.add_argument("--oracle_target_idx", type=int, default=0,
+                        help="Which of the oracle's 3 heads to report "
+                             "(0=hepg2, 1=k562, 2=sknsh). Default 0.")
+    parser.add_argument("--oracle_batch_size", type=int, default=128)
     args = parser.parse_args()
 
     print(f"[eval] loading generated sequences from {args.generated}")
@@ -422,6 +489,34 @@ def main():
               f"score_top{args.top_n}={prop['score_top_mean']:.4f}")
     else:
         print("[eval] no scorer checkpoint — skipping property + feature metrics")
+
+    # -- Independent oracle (DRAKES reward_oracle_eval) --
+    if args.oracle_ckpt and os.path.exists(args.oracle_ckpt):
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if gen_tensor is None:
+            gen_tensor = seqs_to_tensor(gen_seqs)
+        print(f"[eval] loading independent oracle from {args.oracle_ckpt}")
+        oracle = load_independent_oracle(args.oracle_ckpt, device)
+        mu_indep = score_with_oracle(gen_tensor, oracle, device,
+                                     target_idx=args.oracle_target_idx,
+                                     batch_size=args.oracle_batch_size)
+        indep = compute_independent_oracle_metrics(
+            mu_indep, args.top_n, mu_ours=gen_mu)
+        results["independent_oracle"] = {
+            **indep,
+            "target_idx": args.oracle_target_idx,
+            "ckpt_path": args.oracle_ckpt,
+        }
+        print(f"[eval] independent_mu_mean={indep['independent_mu_mean']:.4f}  "
+              f"top{args.top_n}={indep['independent_mu_top_mean']:.4f}"
+              + (f"  pearson_vs_ours={indep['pearson_vs_ours']:.4f}"
+                 if 'pearson_vs_ours' in indep else ''))
+        del oracle
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    elif args.oracle_ckpt:
+        print(f"[eval] --oracle_ckpt {args.oracle_ckpt} not found — skipping")
 
     # -- Diversity --
     div = compute_diversity(gen_seqs)
