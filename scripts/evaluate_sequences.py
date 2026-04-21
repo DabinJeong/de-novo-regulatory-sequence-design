@@ -58,12 +58,32 @@ INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
 # ---------------------------------------------------------------------------
 # Sequence I/O
 # ---------------------------------------------------------------------------
-def load_sequences_csv(path: str, seq_col: str = "seq"):
+def load_sequences_csv(path: str, seq_col: str = "seq",
+                       cell_type: str = None,
+                       cell_type_col: str = "cell_type"):
+    """Load sequences from CSV, optionally filtering by cell_type value.
+
+    If `cell_type` is set, only rows whose `cell_type_col` matches are kept.
+    Matching is case-insensitive substring (so 'HepG2' matches
+    'HepG2_ENCLB441ZZZ' from DNA-Diffusion's tag naming).
+    """
     seqs = []
+    seen_any_match_col = False
     with open(path) as f:
         reader = csv.DictReader(f)
         for row in reader:
+            if cell_type is not None:
+                if cell_type_col not in row:
+                    continue
+                seen_any_match_col = True
+                if cell_type.lower() not in row[cell_type_col].lower():
+                    continue
             seqs.append(row[seq_col].upper())
+    if cell_type is not None and not seen_any_match_col:
+        raise ValueError(
+            f"--cell_type={cell_type!r} requested but column {cell_type_col!r} "
+            f"not present in {path}. Drop the flag or use a CSV with that column."
+        )
     return seqs
 
 
@@ -362,10 +382,18 @@ def main():
                         help="Cap training seqs for feature-space MMD/Wasserstein")
     parser.add_argument("--n_projections", type=int, default=100,
                         help="Random projections for sliced Wasserstein")
+    parser.add_argument("--cell_type", type=str, default=None,
+                        help="If set, keep only generated rows whose 'cell_type' "
+                             "column contains this string (case-insensitive). "
+                             "Useful for filtering DNA-Diffusion's per-cell-type "
+                             "output down to e.g. HepG2 only.")
     args = parser.parse_args()
 
     print(f"[eval] loading generated sequences from {args.generated}")
-    gen_seqs = load_sequences_csv(args.generated, args.seq_col)
+    gen_seqs = load_sequences_csv(args.generated, args.seq_col,
+                                  cell_type=args.cell_type)
+    if args.cell_type:
+        print(f"[eval] filtered to cell_type~={args.cell_type!r}")
     print(f"[eval] {len(gen_seqs)} generated sequences loaded")
 
     results = {}
