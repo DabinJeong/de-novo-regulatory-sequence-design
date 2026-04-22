@@ -7,42 +7,33 @@ be compared on equal footing.
 
 Metrics
 -------
-Property (require PropertyScorer checkpoint):
+Property (our scorer; circular — diagnostic / reward-hacking check):
     - mu_hat       : predicted activity (mean, median, top-k mean)
     - sigma_hat    : epistemic uncertainty (mean)
     - score        : mu - gamma * sigma (mean, median, top-k mean)
 
-Independent oracle (require --oracle_ckpt):
-    - independent_mu : predicted activity from a separately-trained regressor
-                       (DRAKES reward_oracle_eval.ckpt, grelu Enformer, 3-task).
-                       Breaks the guidance/evaluation circularity of using our
-                       own PropertyScorer for both steering and scoring.
+Independent oracle (external activity judge; require --oracle_ckpt):
+    - independent_mu : DRAKES reward_oracle_eval.ckpt (grelu Enformer, 3-task),
+                       non-circular. Also reports Pearson vs our scorer.
 
-Diversity & novelty (sequence-level):
-    - novelty      : min Hamming distance from each generated seq to
-                     the closest training sequence (mean, median)
-    - diversity    : mean pairwise Hamming distance among generated seqs
+Sequence-level:
+    - diversity    : mean pairwise Hamming among generated seqs
     - unique_ratio : fraction of unique sequences
+    - novelty      : min Hamming from each gen seq to nearest training seq
+                     (goal: ↑, far from training)
 
-Distributional (population-level, compare gen vs train distributions):
-    - kmer_kl           : KL(gen || train) of k-mer frequency spectrum
-    - kmer_pearson      : Pearson correlation of k-mer frequency vectors
-                          (DRAKES Table 1 reports this at k=3)
-    - gc_mean/std/kl    : GC-content summary + KL on 20-bin histogram
-    - gc_wasserstein    : 1D Wasserstein on GC-content marginal
-    - mu_wasserstein    : 1D Wasserstein on predicted activity marginal
-                          (requires scorer_ckpt + train_data)
-    - mmd_rbf           : unbiased MMD^2 with RBF kernel in PropertyScorer
-                          penultimate feature space (median bandwidth)
-    - sliced_wasserstein: mean 1D Wasserstein over random projections of
-                          PropertyScorer penultimate features
-                          (geometry-aware, non-parametric)
+Composition (gen-only, descriptive):
+    - gc_mean/std  : GC-content summary — extreme values flag implausibility
 
-JASPAR motif (require --jaspar; needs pyjaspar + biopython):
+Feature-space OOD (PropertyScorer penultimate, 128-D; goal: ↑ vs training):
+    - mmd_rbf           : MMD^2 with RBF kernel (median bandwidth)
+    - sliced_wasserstein: mean 1D Wasserstein over random projections
+                          (Rabin+2011, Bonneel+2015)
+    - mu_wasserstein    : 1D Wasserstein on predicted-activity marginal
+
+JASPAR motif (gen-only, biological plausibility; require --jaspar):
     - motif_hits_per_seq_mean / median : PSSM hits per sequence at FPR=1e-3
-    - motif_coverage                   : fraction of seqs with at least one hit
-    - motif_freq_pearson               : Pearson correlation between gen and
-                                         train per-motif hit rates
+    - motif_coverage                   : fraction of seqs with >=1 hit
 
 CLI
 ---
@@ -53,7 +44,6 @@ CLI
         --oracle_ckpt DRAKES_data/.../reward_oracle_eval.ckpt \
         --oracle_target_idx 0 \
         --out_dir     runs/guided/eval \
-        --k 5                # k for k-mer spectrum \
         --top_n 100          # top-N for top-k metrics \
         --n_projections 100  # random projections for sliced Wasserstein
 """
@@ -62,7 +52,6 @@ import argparse
 import csv
 import json
 import os
-from collections import Counter
 
 import numpy as np
 import torch
@@ -259,81 +248,12 @@ def compute_diversity(gen_seqs, max_seqs: int = 2000):
 
 
 # ---------------------------------------------------------------------------
-# k-mer spectrum
-# ---------------------------------------------------------------------------
-def kmer_frequencies(seqs, k: int = 5):
-    counts = Counter()
-    total = 0
-    for s in seqs:
-        for i in range(len(s) - k + 1):
-            kmer = s[i:i + k]
-            if all(c in "ACGT" for c in kmer):
-                counts[kmer] += 1
-                total += 1
-    freq = {kmer: c / total for kmer, c in counts.items()} if total > 0 else {}
-    return freq
-
-
-def kl_divergence(p_freq, q_freq, pseudocount: float = 1e-8):
-    all_kmers = set(p_freq) | set(q_freq)
-    total_p = sum(p_freq.values()) + pseudocount * len(all_kmers)
-    total_q = sum(q_freq.values()) + pseudocount * len(all_kmers)
-    kl = 0.0
-    for kmer in all_kmers:
-        p = (p_freq.get(kmer, 0) + pseudocount) / total_p
-        q = (q_freq.get(kmer, 0) + pseudocount) / total_q
-        kl += p * np.log(p / q)
-    return float(kl)
-
-
-def kmer_pearson(p_freq, q_freq):
-    """Pearson correlation between two k-mer frequency dicts.
-
-    Aligned over the union of keys (missing k-mers get frequency 0). Returns
-    NaN when either side has zero variance (e.g. all-N inputs). DRAKES'
-    "3-mer Pearson" metric uses this form over global frequency vectors.
-    """
-    all_kmers = sorted(set(p_freq) | set(q_freq))
-    if not all_kmers:
-        return float("nan")
-    p_vec = np.array([p_freq.get(k, 0.0) for k in all_kmers])
-    q_vec = np.array([q_freq.get(k, 0.0) for k in all_kmers])
-    if p_vec.std() == 0 or q_vec.std() == 0:
-        return float("nan")
-    return float(np.corrcoef(p_vec, q_vec)[0, 1])
-
-
-def compute_kmer_metrics(gen_seqs, train_seqs, k: int = 5,
-                         pearson_ks=(3,)):
-    gen_freq = kmer_frequencies(gen_seqs, k)
-    train_freq = kmer_frequencies(train_seqs, k)
-    metrics = {
-        f"{k}mer_kl": kl_divergence(gen_freq, train_freq),
-        f"{k}mer_pearson": kmer_pearson(gen_freq, train_freq),
-        f"{k}mer_unique_gen": len(gen_freq),
-        f"{k}mer_unique_train": len(train_freq),
-    }
-    # DRAKES' Table 1 reports 3-mer Pearson regardless of the k used for KL,
-    # so always compute it (unless already covered by k) for direct comparison.
-    for k_extra in pearson_ks:
-        if k_extra == k:
-            continue
-        g = kmer_frequencies(gen_seqs, k_extra)
-        t = kmer_frequencies(train_seqs, k_extra)
-        metrics[f"{k_extra}mer_pearson"] = kmer_pearson(g, t)
-    return metrics
-
-
-# ---------------------------------------------------------------------------
 # JASPAR motif scanning
 #
 # Loads vertebrate core PWMs via pyjaspar, builds biopython PSSMs, scans each
 # sequence on both strands at a fixed FPR threshold, and reports:
 #   - motif_hits_per_seq_mean/median : hit density per sequence
 #   - motif_coverage                 : fraction of seqs with >=1 hit
-#   - motif_freq_pearson             : Pearson corr. between gen and train
-#                                      motif-frequency vectors (one entry
-#                                      per motif), analogous to k-mer Pearson
 # ---------------------------------------------------------------------------
 def _load_jaspar_pssms(release: str, collection: str, tax_group: str,
                        pseudocount: float, max_motifs: int = None):
@@ -401,15 +321,15 @@ def scan_jaspar_motifs(seqs, release: str = "JASPAR2022",
     return hits_per_seq, motif_freq, [mid for mid, _ in pssms]
 
 
-def compute_jaspar_metrics(gen_seqs, train_seqs=None, release: str = "JASPAR2022",
+def compute_jaspar_metrics(gen_seqs, release: str = "JASPAR2022",
                            collection: str = "CORE",
                            tax_group: str = "vertebrates",
                            fpr: float = 1e-3, max_motifs: int = None):
-    gen_hits, gen_freq, motif_ids = scan_jaspar_motifs(
+    gen_hits, _, motif_ids = scan_jaspar_motifs(
         gen_seqs, release=release, collection=collection,
         tax_group=tax_group, fpr=fpr, max_motifs=max_motifs)
 
-    metrics = {
+    return {
         "motif_hits_per_seq_mean": float(gen_hits.mean()),
         "motif_hits_per_seq_median": float(np.median(gen_hits)),
         "motif_coverage": float((gen_hits > 0).mean()),
@@ -418,29 +338,15 @@ def compute_jaspar_metrics(gen_seqs, train_seqs=None, release: str = "JASPAR2022
         "release": release,
         "collection": collection,
     }
-    if train_seqs:
-        _, train_freq, _ = scan_jaspar_motifs(
-            train_seqs, release=release, collection=collection,
-            tax_group=tax_group, fpr=fpr, max_motifs=max_motifs)
-        # Pearson between per-motif hit rates: does the generated distribution
-        # over motifs look like the training distribution?
-        if gen_freq.std() > 0 and train_freq.std() > 0:
-            metrics["motif_freq_pearson"] = float(
-                np.corrcoef(gen_freq, train_freq)[0, 1])
-        else:
-            metrics["motif_freq_pearson"] = float("nan")
-    return metrics
 
 
 # ---------------------------------------------------------------------------
 # Feature-space distribution metrics (MMD, Sliced Wasserstein)
 #
-# Rationale: kmer_kl operates on discrete k-mer histograms and ignores
-# sequence geometry (AAAAA and AAAAT are treated as orthogonal bins).
-# MMD and Wasserstein are sample-based two-sample metrics that work in
-# any embedding space — here we use PropertyScorer's penultimate features
-# so that "distance between distributions" reflects activity-relevant
-# geometry rather than raw composition.
+# Goal: ↑ distance from training in PropertyScorer's penultimate feature
+# space — our objective is to generate OOD sequences. These metrics should
+# be read jointly with the independent oracle (OOD + high oracle μ = real
+# functional novelty; OOD + low oracle μ = reward hacking).
 # ---------------------------------------------------------------------------
 def extract_penultimate_features(tensor, scorer, device, batch_size: int = 256,
                                  member_idx: int = 0):
@@ -553,19 +459,11 @@ def gc_content(seq: str) -> float:
     return gc / len(seq) if len(seq) > 0 else 0.0
 
 
-def gc_kl(gen_seqs, train_seqs, n_bins: int = 20):
+def compute_gc_stats(gen_seqs):
     gen_gc = [gc_content(s) for s in gen_seqs]
-    train_gc = [gc_content(s) for s in train_seqs]
-    bins = np.linspace(0, 1, n_bins + 1)
-    gen_hist = np.histogram(gen_gc, bins=bins, density=True)[0] + 1e-8
-    train_hist = np.histogram(train_gc, bins=bins, density=True)[0] + 1e-8
-    gen_hist /= gen_hist.sum()
-    train_hist /= train_hist.sum()
-    kl = float((gen_hist * np.log(gen_hist / train_hist)).sum())
     return {
         "gc_mean": float(np.mean(gen_gc)),
         "gc_std": float(np.std(gen_gc)),
-        "gc_kl": kl,
     }
 
 
@@ -577,11 +475,10 @@ def main():
     parser.add_argument("--generated", type=str, required=True,
                         help="CSV with generated sequences (must have 'seq' column)")
     parser.add_argument("--train_data", type=str, default=None,
-                        help="CSV with training sequences for novelty/kmer metrics")
+                        help="CSV with training sequences for novelty + feature-space metrics")
     parser.add_argument("--scorer_ckpt", type=str, default=None,
                         help="PropertyScorer checkpoint for mu/sigma metrics")
     parser.add_argument("--out_dir", type=str, default=None)
-    parser.add_argument("--k", type=int, default=5, help="k for k-mer spectrum")
     parser.add_argument("--top_n", type=int, default=100, help="top-N for top-k metrics")
     parser.add_argument("--gamma", type=float, default=1.0, help="gamma for score = mu - gamma*sigma")
     parser.add_argument("--seq_col", type=str, default="seq")
@@ -614,9 +511,6 @@ def main():
     parser.add_argument("--jaspar_max_motifs", type=int, default=None,
                         help="Cap the number of JASPAR motifs scanned (useful "
                              "for smoke tests; unset = scan all).")
-    parser.add_argument("--jaspar_max_train", type=int, default=2000,
-                        help="Cap training seqs for JASPAR scan (scanning all "
-                             "of gosai_all.csv on 700 motifs is costly).")
     args = parser.parse_args()
 
     print(f"[eval] loading generated sequences from {args.generated}")
@@ -681,61 +575,47 @@ def main():
     elif args.oracle_ckpt:
         print(f"[eval] --oracle_ckpt {args.oracle_ckpt} not found — skipping")
 
-    # -- Diversity --
+    # -- Diversity (gen-only) --
     div = compute_diversity(gen_seqs)
     results["diversity"] = div
     print(f"[eval] diversity={div['diversity']:.4f}  "
           f"unique_ratio={div['unique_ratio']:.4f}")
 
-    # -- Novelty & distributional (need training data) --
+    # -- GC content (gen-only, descriptive) --
+    gc = compute_gc_stats(gen_seqs)
+    results["gc"] = gc
+    print(f"[eval] gc_mean={gc['gc_mean']:.4f}  gc_std={gc['gc_std']:.4f}")
+
+    # -- JASPAR motif (gen-only, biological plausibility) --
+    if args.jaspar:
+        print(f"[eval] scanning JASPAR {args.jaspar_release}/"
+              f"{args.jaspar_collection}/{args.jaspar_tax_group} "
+              f"at FPR={args.jaspar_fpr}")
+        jmetrics = compute_jaspar_metrics(
+            gen_seqs,
+            release=args.jaspar_release,
+            collection=args.jaspar_collection,
+            tax_group=args.jaspar_tax_group,
+            fpr=args.jaspar_fpr,
+            max_motifs=args.jaspar_max_motifs)
+        results["jaspar"] = jmetrics
+        print(f"[eval] motif_hits/seq={jmetrics['motif_hits_per_seq_mean']:.2f}  "
+              f"coverage={jmetrics['motif_coverage']:.3f}  "
+              f"motifs={jmetrics['num_motifs']}")
+
+    # -- Metrics requiring training data --
     if args.train_data and os.path.exists(args.train_data):
         train_seqs = load_train_sequences(args.train_data, args.seq_col,
                                           max_seqs=args.max_train)
         print(f"[eval] {len(train_seqs)} training sequences loaded")
 
+        # Seq-level novelty (Hamming to nearest training seq; goal: ↑)
         nov = compute_novelty(gen_seqs, train_seqs, max_train=args.max_train)
         results["novelty"] = nov
         print(f"[eval] novelty_mean={nov['novelty_mean']:.4f}  "
               f"novelty_median={nov['novelty_median']:.4f}")
 
-        kmer = compute_kmer_metrics(gen_seqs, train_seqs, k=args.k)
-        results["kmer"] = kmer
-        msg = (f"[eval] {args.k}mer_kl={kmer[f'{args.k}mer_kl']:.6f}  "
-               f"{args.k}mer_pearson={kmer[f'{args.k}mer_pearson']:.4f}")
-        if "3mer_pearson" in kmer and args.k != 3:
-            msg += f"  3mer_pearson={kmer['3mer_pearson']:.4f}"
-        print(msg)
-
-        gc = gc_kl(gen_seqs, train_seqs)
-        gc["gc_wasserstein"] = wasserstein_1d(
-            [gc_content(s) for s in gen_seqs],
-            [gc_content(s) for s in train_seqs])
-        results["gc"] = gc
-        print(f"[eval] gc_mean={gc['gc_mean']:.4f}  gc_kl={gc['gc_kl']:.6f}  "
-              f"gc_wasserstein={gc['gc_wasserstein']:.4f}")
-
-        # -- JASPAR motif --
-        if args.jaspar:
-            print(f"[eval] scanning JASPAR {args.jaspar_release}/"
-                  f"{args.jaspar_collection}/{args.jaspar_tax_group} "
-                  f"at FPR={args.jaspar_fpr}")
-            train_sub = train_seqs[:args.jaspar_max_train]
-            jmetrics = compute_jaspar_metrics(
-                gen_seqs, train_sub,
-                release=args.jaspar_release,
-                collection=args.jaspar_collection,
-                tax_group=args.jaspar_tax_group,
-                fpr=args.jaspar_fpr,
-                max_motifs=args.jaspar_max_motifs)
-            results["jaspar"] = jmetrics
-            msg = (f"[eval] motif_hits/seq={jmetrics['motif_hits_per_seq_mean']:.2f}  "
-                   f"coverage={jmetrics['motif_coverage']:.3f}  "
-                   f"motifs={jmetrics['num_motifs']}")
-            if "motif_freq_pearson" in jmetrics:
-                msg += f"  motif_freq_pearson={jmetrics['motif_freq_pearson']:.4f}"
-            print(msg)
-
-        # -- Feature-space MMD / Sliced Wasserstein --
+        # Feature-space OOD (MMD / Sliced W / mu_wasserstein; goal: ↑)
         if scorer is not None:
             train_tensor = seqs_to_tensor(train_seqs)
             train_mu, _ = score_tensor(train_tensor, scorer, device)
@@ -748,24 +628,6 @@ def main():
             print(f"[eval] mmd_rbf={feat_dist['mmd_rbf']:.6f}  "
                   f"sliced_wasserstein={feat_dist['sliced_wasserstein']:.4f}  "
                   f"mu_wasserstein={feat_dist['mu_wasserstein']:.4f}")
-    else:
-        gc = gc_kl(gen_seqs, [])
-        results["gc"] = {"gc_mean": gc["gc_mean"], "gc_std": gc["gc_std"]}
-        print(f"[eval] gc_mean={gc['gc_mean']:.4f}  (no train data for kmer/novelty/feature)")
-
-        if args.jaspar:
-            print(f"[eval] scanning JASPAR (gen-only, no train reference)")
-            jmetrics = compute_jaspar_metrics(
-                gen_seqs, None,
-                release=args.jaspar_release,
-                collection=args.jaspar_collection,
-                tax_group=args.jaspar_tax_group,
-                fpr=args.jaspar_fpr,
-                max_motifs=args.jaspar_max_motifs)
-            results["jaspar"] = jmetrics
-            print(f"[eval] motif_hits/seq={jmetrics['motif_hits_per_seq_mean']:.2f}  "
-                  f"coverage={jmetrics['motif_coverage']:.3f}  "
-                  f"motifs={jmetrics['num_motifs']}")
 
     # -- Save --
     if args.out_dir:
