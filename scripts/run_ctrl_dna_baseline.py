@@ -21,10 +21,10 @@ What this script does
    max_new_tokens=L, temperature, top_k, top_p, seed)`. regLM's label
    convention for the Gosai enhancer task is a 3-char binary string:
        "100" -> HepG2,  "010" -> K562,  "001" -> SK-N-SH.
-3. Scores each sequence with our PropertyScorer so that (mu_hat,
-   sigma_hat) are directly comparable to guided_sampler / DRAKES / SVDD.
-4. Writes a CSV with columns `seq, mu, sigma, score` where
-       score = mu - gamma_rank * sigma.
+3. Writes a single-column CSV (`seq`) for downstream evaluation by
+   `scripts.evaluate_sequences`, which scores with the independent DRAKES
+   oracle (primary, non-circular) and PropertyScorer (circular,
+   diagnostic).
 
 CLI
 ---
@@ -42,8 +42,6 @@ import torch
 import yaml
 from ml_collections.config_dict import ConfigDict
 from tqdm import tqdm
-
-from sequence_generation.model.property_scorer import PropertyScorer
 
 
 INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
@@ -139,39 +137,6 @@ def sample_reglm(model, ctrl_cfg, num_batches: int,
     return torch.cat(all_seqs, dim=0)
 
 
-def load_scorer(cfg, alphabet_size: int, device: torch.device) -> PropertyScorer:
-    ens_cfg = cfg.ensemble
-    scorer = PropertyScorer(
-        alphabet_size=alphabet_size,
-        num_members=ens_cfg.get("num_members", 5),
-        hidden_dim=ens_cfg.get("hidden_dim", 128),
-        depth=ens_cfg.get("depth", 4),
-        dropout=ens_cfg.get("dropout", 0.1),
-    )
-    ckpt = ens_cfg.checkpoint_path
-    if not os.path.exists(ckpt):
-        raise FileNotFoundError(f"PropertyScorer checkpoint not found at {ckpt}.")
-    sd = torch.load(ckpt, map_location="cpu")
-    scorer.load_state_dict(sd.get("model", sd))
-    scorer.to(device).eval()
-    for p in scorer.parameters():
-        p.requires_grad_(False)
-    print(f"[PropertyScorer] loaded {ckpt}")
-    return scorer
-
-
-@torch.no_grad()
-def score_sequences(scorer: PropertyScorer, seqs: torch.Tensor,
-                    batch_size: int = 256):
-    mus, sigmas = [], []
-    for i in range(0, seqs.size(0), batch_size):
-        chunk = seqs[i:i + batch_size]
-        mu, var = scorer.mu_sigma2({"seqs": chunk.to(next(scorer.parameters()).device)})
-        mus.append(mu.squeeze(-1).cpu())
-        sigmas.append(var.clamp_min(1e-12).sqrt().squeeze(-1).cpu())
-    return torch.cat(mus, 0), torch.cat(sigmas, 0)
-
-
 def seqs_to_strings(seqs: torch.Tensor):
     return ["".join(INT_TO_BASE[t] for t in row.tolist()) for row in seqs]
 
@@ -194,7 +159,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = load_reglm_model(config.ctrl_dna, device)
-    scorer = load_scorer(config, config.model.alphabet_size, device)
 
     s = config.sampling
     seqs = sample_reglm(
@@ -202,17 +166,13 @@ def main():
         num_batches=s.num_batches, batch_size=s.batch_size,
         seq_length=s.seq_length, seed=seed,
     )
-    mu, sigma = score_sequences(scorer, seqs)
-    gamma = float(s.get("gamma_rank", 1.0))
-    score = mu - gamma * sigma
 
     out_path = os.path.join(args.out_dir, "ctrl_dna_sequences.csv")
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["seq", "mu", "sigma", "score"])
-        for string, m, sg, sc in zip(seqs_to_strings(seqs),
-                                     mu.tolist(), sigma.tolist(), score.tolist()):
-            writer.writerow([string, f"{m:.4f}", f"{sg:.4f}", f"{sc:.4f}"])
+        writer.writerow(["seq"])
+        for string in seqs_to_strings(seqs):
+            writer.writerow([string])
     print(f"[ctrl_dna_baseline] wrote {seqs.size(0)} sequences -> {out_path}")
 
 

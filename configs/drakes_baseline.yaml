@@ -35,21 +35,9 @@ drakes:
   # checkpoint_kind under base_path/mdlm/.../*.ckpt.
   checkpoint_path: null
 
-# ---------------------------------------------------------------------------
-# Our ensemble regressor for scoring (mu, sigma) — same model used by
-# scripts/guided_sampler.py, so the comparison is fair.
-# ---------------------------------------------------------------------------
-ensemble:
-  checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
-  num_members: 5
-  hidden_dim: 128
-  depth: 4
-  dropout: 0.1
-
 model:
   alphabet_size: 4 # A,C,G,T — matches DRAKES and our pipeline
 
 sampling:
   num_batches: 10
   batch_size: 64
-  gamma_rank: 1.0 # score = mu - gamma_rank * sigma
