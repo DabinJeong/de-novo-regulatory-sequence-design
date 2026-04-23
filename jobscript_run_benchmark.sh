@@ -20,6 +20,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 run_dir="/nfs/team361/dj16/projects/sequence_generation/"
 output_dir="/lustre/scratch126/cellgen/lotfollahi/dj16/projects/sequence_generation/outputs"
 
+# Independent (non-circular) evaluation oracle used by scripts.evaluate_sequences.
+# grelu EnformerPretrainedModel 3-task, distributed by DRAKES. Picked up as the
+# --oracle_ckpt default when the flag is omitted.
+export DRAKES_EVAL_ORACLE="/nfs/team361/dj16/projects/sequence_generation_baselines/DRAKES_data/data_and_model/mdlm/outputs_gosai/lightning_logs/reward_oracle_eval.ckpt"
+
 ENV_PATH="/nfs/team361/dj16/pypoetry/virtualenvs/sequence-generation-7Ds7Y9Ey-py3.12/bin/activate"
 
 [ -f $ENV_PATH ] && source $ENV_PATH || echo "Failed to activate: ${ENV_PATH}"

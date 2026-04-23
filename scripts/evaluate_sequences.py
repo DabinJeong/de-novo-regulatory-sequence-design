@@ -5,16 +5,34 @@ Computes a standardised set of metrics so that generated sequences from
 any method (guided sampler, DRAKES, SVDD, Ctrl-DNA, DNA-Diffusion) can
 be compared on equal footing.
 
+Primary vs diagnostic
+---------------------
+The PRIMARY judge is the **independent oracle** — DRAKES-distributed
+`reward_oracle_eval.ckpt` (grelu `EnformerPretrainedModel`, 3-task) —
+which was trained by a third party and shares no weights with any
+method's guidance/reward model. This makes cross-method comparisons
+non-circular.
+
+The PropertyScorer ensemble is kept as a DIAGNOSTIC signal only: our
+guided sampler uses it for guidance, so its metrics here are circular
+and useful mainly for reward-hacking detection (gap between circular μ
+and independent μ flags hacking; Pearson correlation quantifies it).
+
 Metrics
 -------
-Property (our scorer; circular — diagnostic / reward-hacking check):
+Independent oracle (PRIMARY; non-circular):
+    - independent_mu_mean / median / top_mean : activity under the
+      independent judge
+    - pearson_vs_ours                         : correlation with
+      PropertyScorer μ (low ⇒ circular scorer is being hacked)
+    - mu_wasserstein_vs_train                 : 1D Wasserstein between
+      gen-set μ and training-set μ, both under the independent oracle
+      (goal: ↑, far-from-training activity distribution)
+
+Property (PropertyScorer; CIRCULAR — diagnostic, reward-hacking check):
     - mu_hat       : predicted activity (mean, median, top-k mean)
     - sigma_hat    : epistemic uncertainty (mean)
     - score        : mu - gamma * sigma (mean, median, top-k mean)
-
-Independent oracle (external activity judge; require --oracle_ckpt):
-    - independent_mu : DRAKES reward_oracle_eval.ckpt (grelu Enformer, 3-task),
-                       non-circular. Also reports Pearson vs our scorer.
 
 Sequence-level:
     - diversity    : mean pairwise Hamming among generated seqs
@@ -26,26 +44,46 @@ Composition (gen-only, descriptive):
     - gc_mean/std  : GC-content summary — extreme values flag implausibility
 
 Feature-space OOD (PropertyScorer penultimate, 128-D; goal: ↑ vs training):
-    - mmd_rbf           : MMD^2 with RBF kernel (median bandwidth)
-    - sliced_wasserstein: mean 1D Wasserstein over random projections
-                          (Rabin+2011, Bonneel+2015)
-    - mu_wasserstein    : 1D Wasserstein on predicted-activity marginal
+    Note: this whole block is computed in PropertyScorer feature space,
+    so it is circular with our method. Kept as an auxiliary geometric
+    signal alongside the independent-oracle μ-Wasserstein.
+    - mmd_rbf                : MMD^2 with RBF kernel (median bandwidth)
+    - sliced_wasserstein     : mean 1D Wasserstein over random projections
+                               (Rabin+2011, Bonneel+2015)
+    - mu_wasserstein_circular: 1D Wasserstein on PropertyScorer-μ marginal
 
 JASPAR motif (gen-only, biological plausibility; require --jaspar):
     - motif_hits_per_seq_mean / median : PSSM hits per sequence at FPR=1e-3
     - motif_coverage                   : fraction of seqs with >=1 hit
 
+Output key changes (breaking)
+-----------------------------
+    property                     -> property_circular
+    feature_dist.mu_wasserstein  -> feature_dist.mu_wasserstein_circular
+    independent_oracle.mu_wasserstein_vs_train   (new)
+
 CLI
 ---
+    # Option 1: env var default (recommended for shared infra)
+    DRAKES_EVAL_ORACLE=/path/to/reward_oracle_eval.ckpt \
+    python -m scripts.evaluate_sequences \
+        --generated   runs/guided/guided_sequences.csv \
+        --train_data  data/gosai_all.csv \
+        --scorer_ckpt runs/ensemble/ensemble_best.ckpt \
+        --out_dir     runs/guided/eval
+
+    # Option 2: explicit --oracle_ckpt
     python -m scripts.evaluate_sequences \
         --generated  runs/guided/guided_sequences.csv \
-        --train_data data/gosai_all.csv \
-        --scorer_ckpt runs/property_scorer/best.ckpt \
         --oracle_ckpt DRAKES_data/.../reward_oracle_eval.ckpt \
-        --oracle_target_idx 0 \
-        --out_dir     runs/guided/eval \
-        --top_n 100          # top-N for top-k metrics \
-        --n_projections 100  # random projections for sliced Wasserstein
+        --out_dir     runs/guided/eval
+
+    # Opt-in: circular-only (PropertyScorer only, no independent oracle).
+    # Clearly labelled in output; not meant for method comparisons.
+    python -m scripts.evaluate_sequences \
+        --generated  runs/guided/guided_sequences.csv \
+        --scorer_ckpt runs/ensemble/ensemble_best.ckpt \
+        --allow_circular_only --out_dir runs/guided/eval_diag
 """
 
 import argparse
@@ -184,7 +222,8 @@ def score_with_oracle(tensor: torch.Tensor, oracle, device, target_idx: int,
 
 
 def compute_independent_oracle_metrics(mu_indep: np.ndarray, top_n: int,
-                                       mu_ours: np.ndarray = None):
+                                       mu_ours: np.ndarray = None,
+                                       mu_indep_train: np.ndarray = None):
     top_n = min(top_n, len(mu_indep))
     top_idx = np.argsort(mu_indep)[-top_n:]
     metrics = {
@@ -195,6 +234,10 @@ def compute_independent_oracle_metrics(mu_indep: np.ndarray, top_n: int,
     if mu_ours is not None and len(mu_ours) == len(mu_indep):
         corr = float(np.corrcoef(mu_indep, mu_ours)[0, 1])
         metrics["pearson_vs_ours"] = corr
+    if mu_indep_train is not None and len(mu_indep_train) > 0:
+        metrics["mu_wasserstein_vs_train"] = wasserstein_1d(
+            mu_indep, mu_indep_train)
+        metrics["independent_mu_train_mean"] = float(mu_indep_train.mean())
     return metrics
 
 
@@ -470,6 +513,31 @@ def compute_gc_stats(gen_seqs):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def _resolve_oracle_ckpt(flag_value, allow_circular_only):
+    """Resolve which independent-oracle checkpoint to use.
+
+    Priority:
+      1. Explicit --oracle_ckpt flag
+      2. $DRAKES_EVAL_ORACLE environment variable
+      3. None + --allow_circular_only (opt-in diagnostic-only eval)
+
+    Raises SystemExit when none of the above holds, so accidental
+    circular-only evaluation is not silently produced.
+    """
+    if flag_value:
+        return flag_value
+    env = os.environ.get("DRAKES_EVAL_ORACLE")
+    if env:
+        return env
+    if allow_circular_only:
+        return None
+    raise SystemExit(
+        "[eval] independent oracle required. Pass --oracle_ckpt, set "
+        "$DRAKES_EVAL_ORACLE, or pass --allow_circular_only to proceed "
+        "with PropertyScorer-only (circular) metrics."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--generated", type=str, required=True,
@@ -495,11 +563,24 @@ def main():
                              "output down to e.g. HepG2 only.")
     parser.add_argument("--oracle_ckpt", type=str, default=None,
                         help="Path to DRAKES-distributed reward_oracle_eval.ckpt "
-                             "(grelu Enformer). Enables independent oracle metrics.")
+                             "(grelu Enformer, 3-task). This is the PRIMARY, "
+                             "non-circular evaluator. If omitted, the env var "
+                             "$DRAKES_EVAL_ORACLE is used. If neither is set, "
+                             "the run fails unless --allow_circular_only is passed.")
     parser.add_argument("--oracle_target_idx", type=int, default=0,
                         help="Which of the oracle's 3 heads to report "
                              "(0=hepg2, 1=k562, 2=sknsh). Default 0.")
     parser.add_argument("--oracle_batch_size", type=int, default=128)
+    parser.add_argument("--oracle_max_train", type=int, default=None,
+                        help="Cap on training seqs passed through the "
+                             "independent oracle for mu_wasserstein_vs_train. "
+                             "Default: reuse --max_train_feats (5000).")
+    parser.add_argument("--allow_circular_only", action="store_true",
+                        help="Bypass the independent-oracle requirement and "
+                             "run only the PropertyScorer (circular) metrics. "
+                             "PropertyScorer is our guidance model, so these "
+                             "numbers are NOT valid for cross-method comparison; "
+                             "use this flag only for local debugging.")
     parser.add_argument("--jaspar", action="store_true",
                         help="Enable JASPAR motif scanning metrics. Requires "
                              "pyjaspar and biopython.")
@@ -513,6 +594,20 @@ def main():
                              "for smoke tests; unset = scan all).")
     args = parser.parse_args()
 
+    args.oracle_ckpt = _resolve_oracle_ckpt(
+        args.oracle_ckpt, args.allow_circular_only)
+    if args.oracle_ckpt and not os.path.exists(args.oracle_ckpt):
+        raise SystemExit(
+            f"[eval] independent oracle ckpt not found: {args.oracle_ckpt!r}. "
+            "Fix --oracle_ckpt or $DRAKES_EVAL_ORACLE, or pass "
+            "--allow_circular_only to run PropertyScorer-only.")
+    if args.oracle_ckpt is None and not args.scorer_ckpt:
+        raise SystemExit(
+            "[eval] nothing to score: neither an independent oracle nor a "
+            "PropertyScorer checkpoint is available. Provide --oracle_ckpt "
+            "(or $DRAKES_EVAL_ORACLE), or --scorer_ckpt with "
+            "--allow_circular_only for a diagnostic-only run.")
+
     print(f"[eval] loading generated sequences from {args.generated}")
     gen_seqs = load_sequences_csv(args.generated, args.seq_col,
                                   cell_type=args.cell_type)
@@ -520,16 +615,82 @@ def main():
         print(f"[eval] filtered to cell_type~={args.cell_type!r}")
     print(f"[eval] {len(gen_seqs)} generated sequences loaded")
 
+    # Insertion order becomes JSON key order (Python 3.7+). Keep
+    # independent_oracle first so the primary judge leads the report.
     results = {}
     scorer = None
-    device = None
-    gen_tensor = None
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    gen_tensor = seqs_to_tensor(gen_seqs)
     gen_mu = None
+    train_seqs = None
+    train_tensor = None
 
-    # -- Property metrics --
+    # Load training sequences upfront so the independent oracle can score
+    # them in the same pass (keeps the Enformer resident for one block).
+    if args.train_data and os.path.exists(args.train_data):
+        train_seqs = load_train_sequences(args.train_data, args.seq_col,
+                                          max_seqs=args.max_train)
+        print(f"[eval] {len(train_seqs)} training sequences loaded")
+
+    # -- [PRIMARY] Independent oracle (DRAKES reward_oracle_eval) --
+    if args.oracle_ckpt:
+        print(f"[eval][PRIMARY] loading independent oracle from "
+              f"{args.oracle_ckpt}")
+        oracle = load_independent_oracle(args.oracle_ckpt, device)
+        mu_indep = score_with_oracle(
+            gen_tensor, oracle, device,
+            target_idx=args.oracle_target_idx,
+            batch_size=args.oracle_batch_size)
+
+        mu_indep_train = None
+        if train_seqs is not None:
+            cap = (args.oracle_max_train
+                   if args.oracle_max_train is not None
+                   else args.max_train_feats)
+            if cap is not None and cap < len(train_seqs):
+                # Use the same deterministic RNG used for feature_dist
+                # subsetting so gen-vs-train comparisons are apples-to-apples.
+                idx = np.random.default_rng(0).choice(
+                    len(train_seqs), size=cap, replace=False)
+                train_sub = [train_seqs[int(i)] for i in idx]
+            else:
+                train_sub = train_seqs
+            train_sub_tensor = seqs_to_tensor(train_sub)
+            print(f"[eval][PRIMARY] scoring {len(train_sub)} training seqs "
+                  f"through independent oracle")
+            mu_indep_train = score_with_oracle(
+                train_sub_tensor, oracle, device,
+                target_idx=args.oracle_target_idx,
+                batch_size=args.oracle_batch_size)
+
+        del oracle
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        indep = compute_independent_oracle_metrics(
+            mu_indep, args.top_n,
+            mu_ours=None,  # filled below after PropertyScorer runs
+            mu_indep_train=mu_indep_train)
+        # Stash for post-scorer Pearson refresh.
+        results["independent_oracle"] = {
+            **indep,
+            "target_idx": args.oracle_target_idx,
+            "ckpt_path": args.oracle_ckpt,
+        }
+        msg = (f"[eval][PRIMARY] independent_mu_mean="
+               f"{indep['independent_mu_mean']:.4f}  "
+               f"top{args.top_n}={indep['independent_mu_top_mean']:.4f}")
+        if "mu_wasserstein_vs_train" in indep:
+            msg += f"  mu_W_vs_train={indep['mu_wasserstein_vs_train']:.4f}"
+        print(msg)
+    else:
+        mu_indep = None
+        print("[eval] running in --allow_circular_only mode "
+              "(no independent oracle)")
+
+    # -- [CIRCULAR] PropertyScorer metrics (DIAGNOSTIC ONLY) --
     if args.scorer_ckpt and os.path.exists(args.scorer_ckpt):
         from sequence_generation.model.property_scorer import PropertyScorer
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         scorer = PropertyScorer(alphabet_size=4)
         sd = torch.load(args.scorer_ckpt, map_location="cpu")
         scorer.load_state_dict(sd.get("model", sd))
@@ -537,43 +698,30 @@ def main():
         for p in scorer.parameters():
             p.requires_grad_(False)
 
-        gen_tensor = seqs_to_tensor(gen_seqs)
         gen_mu, gen_sigma = score_tensor(gen_tensor, scorer, device)
         prop = compute_property_metrics(gen_mu, gen_sigma, args.gamma, args.top_n)
-        results["property"] = prop
-        print(f"[eval] property: mu_mean={prop['mu_mean']:.4f}  "
+        results["property_circular"] = prop
+        print(f"[eval][circular] property_circular (diagnostic): "
+              f"mu_mean={prop['mu_mean']:.4f}  "
               f"score_mean={prop['score_mean']:.4f}  "
               f"score_top{args.top_n}={prop['score_top_mean']:.4f}")
-    else:
-        print("[eval] no scorer checkpoint — skipping property + feature metrics")
 
-    # -- Independent oracle (DRAKES reward_oracle_eval) --
-    if args.oracle_ckpt and os.path.exists(args.oracle_ckpt):
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if gen_tensor is None:
-            gen_tensor = seqs_to_tensor(gen_seqs)
-        print(f"[eval] loading independent oracle from {args.oracle_ckpt}")
-        oracle = load_independent_oracle(args.oracle_ckpt, device)
-        mu_indep = score_with_oracle(gen_tensor, oracle, device,
-                                     target_idx=args.oracle_target_idx,
-                                     batch_size=args.oracle_batch_size)
-        indep = compute_independent_oracle_metrics(
-            mu_indep, args.top_n, mu_ours=gen_mu)
-        results["independent_oracle"] = {
-            **indep,
-            "target_idx": args.oracle_target_idx,
-            "ckpt_path": args.oracle_ckpt,
-        }
-        print(f"[eval] independent_mu_mean={indep['independent_mu_mean']:.4f}  "
-              f"top{args.top_n}={indep['independent_mu_top_mean']:.4f}"
-              + (f"  pearson_vs_ours={indep['pearson_vs_ours']:.4f}"
-                 if 'pearson_vs_ours' in indep else ''))
-        del oracle
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-    elif args.oracle_ckpt:
-        print(f"[eval] --oracle_ckpt {args.oracle_ckpt} not found — skipping")
+        # Backfill Pearson(indep, ours) now that gen_mu is available.
+        if mu_indep is not None and len(mu_indep) == len(gen_mu):
+            corr = float(np.corrcoef(mu_indep, gen_mu)[0, 1])
+            results["independent_oracle"]["pearson_vs_ours"] = corr
+            print(f"[eval][PRIMARY] pearson(indep, ours)={corr:.4f}  "
+                  f"(low ⇒ PropertyScorer is being hacked)")
+            if args.oracle_target_idx != 0:
+                print(f"[eval] note: --oracle_target_idx="
+                      f"{args.oracle_target_idx} (not 0=hepg2); Pearson "
+                      "assumes PropertyScorer was trained for the same head.")
+    elif args.scorer_ckpt:
+        print(f"[eval] --scorer_ckpt {args.scorer_ckpt} not found — "
+              "skipping circular property + feature metrics")
+    else:
+        print("[eval] no scorer checkpoint — skipping circular property + "
+              "feature metrics")
 
     # -- Diversity (gen-only) --
     div = compute_diversity(gen_seqs)
@@ -585,6 +733,30 @@ def main():
     gc = compute_gc_stats(gen_seqs)
     results["gc"] = gc
     print(f"[eval] gc_mean={gc['gc_mean']:.4f}  gc_std={gc['gc_std']:.4f}")
+
+    # -- Metrics requiring training data --
+    if train_seqs is not None:
+        # Seq-level novelty (Hamming to nearest training seq; goal: ↑)
+        nov = compute_novelty(gen_seqs, train_seqs, max_train=args.max_train)
+        results["novelty"] = nov
+        print(f"[eval] novelty_mean={nov['novelty_mean']:.4f}  "
+              f"novelty_median={nov['novelty_median']:.4f}")
+
+        # Feature-space OOD (circular under PropertyScorer; goal: ↑)
+        if scorer is not None:
+            train_tensor = seqs_to_tensor(train_seqs)
+            train_mu, _ = score_tensor(train_tensor, scorer, device)
+            feat_dist = compute_feature_distribution_metrics(
+                gen_tensor, train_tensor, scorer, device,
+                max_train_feats=args.max_train_feats,
+                n_projections=args.n_projections)
+            feat_dist["mu_wasserstein_circular"] = wasserstein_1d(
+                gen_mu, train_mu)
+            results["feature_dist"] = feat_dist
+            print(f"[eval][circular] mmd_rbf={feat_dist['mmd_rbf']:.6f}  "
+                  f"sliced_wasserstein={feat_dist['sliced_wasserstein']:.4f}  "
+                  f"mu_wasserstein_circular="
+                  f"{feat_dist['mu_wasserstein_circular']:.4f}")
 
     # -- JASPAR motif (gen-only, biological plausibility) --
     if args.jaspar:
@@ -602,32 +774,6 @@ def main():
         print(f"[eval] motif_hits/seq={jmetrics['motif_hits_per_seq_mean']:.2f}  "
               f"coverage={jmetrics['motif_coverage']:.3f}  "
               f"motifs={jmetrics['num_motifs']}")
-
-    # -- Metrics requiring training data --
-    if args.train_data and os.path.exists(args.train_data):
-        train_seqs = load_train_sequences(args.train_data, args.seq_col,
-                                          max_seqs=args.max_train)
-        print(f"[eval] {len(train_seqs)} training sequences loaded")
-
-        # Seq-level novelty (Hamming to nearest training seq; goal: ↑)
-        nov = compute_novelty(gen_seqs, train_seqs, max_train=args.max_train)
-        results["novelty"] = nov
-        print(f"[eval] novelty_mean={nov['novelty_mean']:.4f}  "
-              f"novelty_median={nov['novelty_median']:.4f}")
-
-        # Feature-space OOD (MMD / Sliced W / mu_wasserstein; goal: ↑)
-        if scorer is not None:
-            train_tensor = seqs_to_tensor(train_seqs)
-            train_mu, _ = score_tensor(train_tensor, scorer, device)
-            feat_dist = compute_feature_distribution_metrics(
-                gen_tensor, train_tensor, scorer, device,
-                max_train_feats=args.max_train_feats,
-                n_projections=args.n_projections)
-            feat_dist["mu_wasserstein"] = wasserstein_1d(gen_mu, train_mu)
-            results["feature_dist"] = feat_dist
-            print(f"[eval] mmd_rbf={feat_dist['mmd_rbf']:.6f}  "
-                  f"sliced_wasserstein={feat_dist['sliced_wasserstein']:.4f}  "
-                  f"mu_wasserstein={feat_dist['mu_wasserstein']:.4f}")
 
     # -- Save --
     if args.out_dir:
