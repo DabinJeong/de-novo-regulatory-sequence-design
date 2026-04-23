@@ -23,9 +23,8 @@ seed: 42
 # The runner:
 #   1. loads the pretrained regLM LightningModel from disk,
 #   2. samples N sequences conditioned on a cell-type label prefix,
-#   3. scores them with our PropertyScorer,
-#   4. writes CSV with columns `seq, mu, sigma, score` matching our other
-#      baseline runners.
+#   3. writes a single-column CSV (`seq`) for downstream evaluation by
+#      scripts.evaluate_sequences.
 # ---------------------------------------------------------------------------
 
 ctrl_dna:
@@ -51,17 +50,6 @@ ctrl_dna:
   top_k: 0   # 0 -> disabled (passed as None)
   top_p: 1.0 # 1.0 -> disabled (passed as None)
 
-# ---------------------------------------------------------------------------
-# Our ensemble regressor for scoring (mu, sigma) — same model used by
-# scripts/guided_sampler.py, so the comparison is fair.
-# ---------------------------------------------------------------------------
-ensemble:
-  checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
-  num_members: 5
-  hidden_dim: 128
-  depth: 4
-  dropout: 0.1
-
 model:
   alphabet_size: 4 # A,C,G,T
 
@@ -71,4 +59,3 @@ sampling:
   num_batches: 20
   batch_size: 32
   seq_length: 200 # Gosai enhancer length
-  gamma_rank: 1.0 # score = mu - gamma_rank * sigma

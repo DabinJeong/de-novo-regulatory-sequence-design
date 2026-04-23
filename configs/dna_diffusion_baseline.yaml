@@ -32,21 +32,9 @@ dna_diffusion:
   # without extra guidance, >1.0 strengthens conditioning).
   guidance_scale: 1.0
 
-# ---------------------------------------------------------------------------
-# Our ensemble regressor for scoring (mu, sigma) — same model used by
-# scripts/guided_sampler.py so this baseline is apples-to-apples.
-# ---------------------------------------------------------------------------
-ensemble:
-  checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
-  num_members: 5
-  hidden_dim: 128
-  depth: 4
-  dropout: 0.1
-
 model:
   alphabet_size: 4 # A,C,G,T — matches DNA-Diffusion's nucleotide order
 
 sampling:
   number_of_samples: 640 # per cell type (DNA-Diffusion semantics)
   sample_batch_size: 64
-  gamma_rank: 1.0 # score = mu - gamma_rank * sigma

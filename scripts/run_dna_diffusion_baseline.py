@@ -12,10 +12,10 @@ What this script does
 3. Calls the repo's own `model.sample(classes, shape, cond_weight)` routine
    per requested cell type, collecting (batch, 4, L) one-hot samples.
 4. Converts the one-hots to token IDs (A=0, C=1, G=2, T=3).
-5. Scores every sequence with our PropertyScorer (ensemble predictor).
-6. Writes a CSV with columns `seq, mu, sigma, score, cell_type` matching
-   the schema emitted by scripts/guided_sampler.py (plus a cell_type column
-   so the downstream evaluator can filter per target).
+5. Writes a CSV with columns `seq, cell_type` for downstream evaluation by
+   `scripts.evaluate_sequences`. The evaluator scores with the independent
+   DRAKES oracle (primary, non-circular) and PropertyScorer (circular,
+   diagnostic); the cell_type column lets the evaluator filter per target.
 
 CLI
 ---
@@ -34,8 +34,6 @@ import torch
 import yaml
 from ml_collections.config_dict import ConfigDict
 from tqdm import tqdm
-
-from sequence_generation.model.property_scorer import PropertyScorer
 
 
 INT_TO_BASE = {0: "A", 1: "C", 2: "G", 3: "T"}
@@ -151,40 +149,6 @@ def sample_dna_diffusion(diffusion, data, cell_types, num_samples: int,
     return torch.cat(all_ids, dim=0), all_cts
 
 
-def load_scorer(cfg, alphabet_size: int, device: torch.device) -> PropertyScorer:
-    ens_cfg = cfg.ensemble
-    scorer = PropertyScorer(
-        alphabet_size=alphabet_size,
-        num_members=ens_cfg.get("num_members", 5),
-        hidden_dim=ens_cfg.get("hidden_dim", 128),
-        depth=ens_cfg.get("depth", 4),
-        dropout=ens_cfg.get("dropout", 0.1),
-    )
-    ckpt = ens_cfg.checkpoint_path
-    if not os.path.exists(ckpt):
-        raise FileNotFoundError(f"PropertyScorer checkpoint not found at {ckpt}.")
-    sd = torch.load(ckpt, map_location="cpu")
-    scorer.load_state_dict(sd.get("model", sd))
-    scorer.to(device).eval()
-    for p in scorer.parameters():
-        p.requires_grad_(False)
-    print(f"[PropertyScorer] loaded {ckpt}")
-    return scorer
-
-
-@torch.no_grad()
-def score_sequences(scorer: PropertyScorer, seqs: torch.Tensor,
-                    batch_size: int = 256):
-    mus, sigmas = [], []
-    device = next(scorer.parameters()).device
-    for i in range(0, seqs.size(0), batch_size):
-        chunk = seqs[i:i + batch_size].to(device)
-        mu, var = scorer.mu_sigma2({"seqs": chunk})
-        mus.append(mu.squeeze(-1).cpu())
-        sigmas.append(var.clamp_min(1e-12).sqrt().squeeze(-1).cpu())
-    return torch.cat(mus, 0), torch.cat(sigmas, 0)
-
-
 def seqs_to_strings(seqs: torch.Tensor):
     return ["".join(INT_TO_BASE[t] for t in row.tolist()) for row in seqs]
 
@@ -207,7 +171,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     diffusion, data = load_dna_diffusion(config.dna_diffusion, device)
-    scorer = load_scorer(config, config.model.alphabet_size, device)
 
     s = config.sampling
     seqs, cts = sample_dna_diffusion(
@@ -217,18 +180,13 @@ def main():
         batch_size=s.sample_batch_size,
         guidance_scale=config.dna_diffusion.guidance_scale,
     )
-    mu, sigma = score_sequences(scorer, seqs)
-    gamma = float(s.get("gamma_rank", 1.0))
-    score = mu - gamma * sigma
 
     out_path = os.path.join(args.out_dir, "dna_diffusion_sequences.csv")
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["seq", "mu", "sigma", "score", "cell_type"])
-        for string, m, sg, sc, ct in zip(seqs_to_strings(seqs),
-                                         mu.tolist(), sigma.tolist(),
-                                         score.tolist(), cts):
-            writer.writerow([string, f"{m:.4f}", f"{sg:.4f}", f"{sc:.4f}", ct])
+        writer.writerow(["seq", "cell_type"])
+        for string, ct in zip(seqs_to_strings(seqs), cts):
+            writer.writerow([string, ct])
     print(f"[dna_diffusion_baseline] wrote {seqs.size(0)} sequences -> {out_path}")
 
 
