@@ -30,12 +30,11 @@ ENV_PATH="/nfs/team361/dj16/pypoetry/virtualenvs/sequence-generation-7Ds7Y9Ey-py
 [ -f $ENV_PATH ] && source $ENV_PATH || echo "Failed to activate: ${ENV_PATH}"
 
 
-# === Run baselines ===
+# === Run baselines: generate sequences from each baseline model ===
 # python -m scripts.run_drakes_baseline --config configs/drakes_baseline.yaml --out_dir ./runs/drakes_baseline
-python -m scripts.run_dna_diffusion_baseline --config configs/dna_diffusion_baseline.yaml --out_dir ./runs/dna_diffusion_baseline
-# python -m scripts.run_svdd_baseline --config configs/svdd_baseline.yaml --out_dir ./runs/svdd_baseline
+# python -m scripts.run_dna_diffusion_baseline --config configs/dna_diffusion_baseline.yaml --out_dir ./runs/dna_diffusion_baseline
+python -m scripts.run_svdd_baseline --config configs/svdd_baseline.yaml --out_dir ./runs/svdd_baseline
 # python -m scripts.run_ctrl_dna_baseline --config configs/ctrl_dna_baseline.yaml --out_dir ./runs/ctrl_dna_baseline
-# python -m scripts.run_guided_sampling --config configs/guided_sampling.yaml --out_dir ./runs/guided
 
 # === Evaluate baselines ===
 ORACLE_CKPT=/nfs/team361/dj16/projects/sequence_generation_baselines/DRAKES_data/data_and_model/mdlm/outputs_gosai/lightning_logs/reward_oracle_eval.ckpt

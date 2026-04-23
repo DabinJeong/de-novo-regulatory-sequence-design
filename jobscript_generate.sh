@@ -1,8 +1,8 @@
-#BSUB -J generate_sequence 
+#BSUB -J run_sequence_generation
 #BSUB -G team361
 #BSUB -L /usr/bin/bash
-#BSUB -o generate_sequence.%J.out
-#BSUB -e generate_sequence.%J.err
+#BSUB -o run_sequence_generation.%J.out
+#BSUB -e run_sequence_generation.%J.err
 #BSUB -q training-parallel
 #BSUB -gpu "mode=shared:j_exclusive=no:gmem=76GB:num=1"
 #BSUB -n 16
@@ -25,6 +25,4 @@ ENV_PATH="/nfs/team361/dj16/pypoetry/virtualenvs/sequence-generation-7Ds7Y9Ey-py
 [ -f $ENV_PATH ] && source $ENV_PATH || echo "Failed to activate: ${ENV_PATH}"
 
 # === Generate sequences with guided sampling ===
-# 20 batches x eval_batch_size (32) = 640 sequences, matching DRAKES / SVDD /
-# DNA-Diffusion (per cell type) so eval metrics are comparable across methods.
-python -m scripts.guided_sampler --config configs/enhancer_gosai_guided.yaml --out_dir runs/guided/bounded --num_batches 20
+python -m scripts.guided_sampler --config configs/enhancer_gosai_guided.yaml --out_dir runs/guided --num_batches 40
