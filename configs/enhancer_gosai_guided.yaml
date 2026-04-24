@@ -37,9 +37,9 @@ loader:
 # the values used during training so MaskedSeparatorModel loads the checkpoint.
 masked_separator:
   checkpoint_path: ./runs/masked_separator/masked_separator_best.ckpt
-  target_idx: 0       # 0=hepg2, 1=k562, 2=sknsh (must match trainer)
-  num_envs: 3         # K for K-means env inference (architectural)
-  init_rho: 0.3       # target stable ratio used at init
+  target_idx: 0 # 0=hepg2, 1=k562, 2=sknsh (must match trainer)
+  num_envs: 3 # K for K-means env inference (architectural)
+  init_rho: 0.3 # target stable ratio used at init
 
 # ---------- ensemble property predictor (mu_hat, sigma2_hat) ----------
 ensemble:
@@ -47,7 +47,7 @@ ensemble:
   hidden_dim: 128
   depth: 4
   dropout: 0.1
-  target_idx: 0      # 0=hepg2, 1=k562, 2=sknsh
+  target_idx: 0 # 0=hepg2, 1=k562, 2=sknsh
   checkpoint_path: ./runs/ensemble/ensemble_best.ckpt
 
 # ---------- inference-time guided velocity field ----------
@@ -57,11 +57,11 @@ sampling:
   n_steps: 128
   flow_temp: 1.0
   prior_pseudocount: 0.1
-  alpha_guidance:    1.0     # property guidance strength
-  beta_uncertainty:  1.0     # activity-cliff penalty strength
-  ood_lambda:        0.0     # 0 = in-distribution, ->1 = novelty / OOD push
-  gamma_rank:        1.0     # ranking: -gamma * sigma_hat
-  delta_rank:        0.0     # ranking: +delta * novelty(x)
+  alpha_guidance: 1.0 # property guidance strength
+  beta_uncertainty: 1.0 # activity-cliff penalty strength
+  ood_lambda: 0.0 # 0 = in-distribution, ->1 = novelty / OOD push
+  gamma_rank: 1.0 # ranking: -gamma * sigma_hat
+  delta_rank: 0.0 # ranking: +delta * novelty(x)
   # 20 * eval_batch_size (32) = 640 samples, matching DRAKES / SVDD / DNA-Diffusion.
   # Currently informational; guided_sampler.py reads --num_batches from CLI.
   num_sample_batches: 20
@@ -69,9 +69,9 @@ sampling:
   # These fields are used ONLY by the upstream-style `Sampler` class,
   # not by the new `GuidedSampler`. Kept here to keep one config per
   # backbone instead of fragmenting across files.
-  guidance_scale: 1.0        # mix weight between cls-guided flow and unconditional
-  scale_cls_score: True      # L2-rescale cls_score to match flow-score norm
-  target_class: 0            # target class index for cross-entropy guidance
+  guidance_scale: 1.0 # mix weight between cls-guided flow and unconditional
+  scale_cls_score: True # L2-rescale cls_score to match flow-score norm
+  target_class: 0 # target class index for cross-entropy guidance
 
 train:
   num_epochs: 5

@@ -31,10 +31,10 @@ ENV_PATH="/nfs/team361/dj16/pypoetry/virtualenvs/sequence-generation-7Ds7Y9Ey-py
 
 
 # === Run baselines: generate sequences from each baseline model ===
-python -m scripts.run_drakes_baseline --config configs/drakes_baseline.yaml --out_dir ./runs/drakes_baseline
-python -m scripts.run_dna_diffusion_baseline --config configs/dna_diffusion_baseline.yaml --out_dir ./runs/dna_diffusion_baseline
-python -m scripts.run_svdd_baseline --config configs/svdd_baseline.yaml --out_dir ./runs/svdd_baseline
-python -m scripts.run_ctrl_dna_baseline --config configs/ctrl_dna_baseline.yaml --out_dir ./runs/ctrl_dna_baseline
+# python -m scripts.run_drakes_baseline --config configs/drakes_baseline.yaml --out_dir ./runs/drakes_baseline
+# python -m scripts.run_dna_diffusion_baseline --config configs/dna_diffusion_baseline.yaml --out_dir ./runs/dna_diffusion_baseline
+# python -m scripts.run_svdd_baseline --config configs/svdd_baseline.yaml --out_dir ./runs/svdd_baseline
+# python -m scripts.run_ctrl_dna_baseline --config configs/ctrl_dna_baseline.yaml --out_dir ./runs/ctrl_dna_baseline
 
 # === Evaluate baselines ===
 ORACLE_CKPT=/nfs/team361/dj16/projects/sequence_generation_baselines/DRAKES_data/data_and_model/mdlm/outputs_gosai/lightning_logs/reward_oracle_eval.ckpt
@@ -43,7 +43,7 @@ TRAIN=/lustre/scratch126/cellgen/lotfollahi/dj16/data/sequence_data/enhancer_gos
 for csv in runs/drakes_baseline/drakes_sequences.csv \
            runs/svdd_baseline/svdd_sequences.csv \
            runs/dna_diffusion_baseline/dna_diffusion_sequences.csv \
-           runs/guided/bounded/guided_sequences.csv; do
+           runs/guided/guided_sequences.csv; do
     out=$(dirname $csv)/eval
     python -m scripts.evaluate_sequences \
       --generated $csv \
