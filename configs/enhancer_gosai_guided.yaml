@@ -65,6 +65,13 @@ sampling:
   # 20 * eval_batch_size (32) = 640 samples, matching DRAKES / SVDD / DNA-Diffusion.
   # Currently informational; guided_sampler.py reads --num_batches from CLI.
   num_sample_batches: 20
+  # ---- Upstream classifier-guided Sampler (scripts/sampler.py) ----
+  # These fields are used ONLY by the upstream-style `Sampler` class,
+  # not by the new `GuidedSampler`. Kept here to keep one config per
+  # backbone instead of fragmenting across files.
+  guidance_scale: 1.0        # mix weight between cls-guided flow and unconditional
+  scale_cls_score: True      # L2-rescale cls_score to match flow-score norm
+  target_class: 0            # target class index for cross-entropy guidance
 
 train:
   num_epochs: 5
