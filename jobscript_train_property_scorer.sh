@@ -41,3 +41,6 @@ python -m scripts.analyze_invariant_separator --config configs/enhancer_gosai_ma
 
 # === Visualize mask ===
 python -m scripts.visualize_mask_structure --config configs/enhancer_gosai_masked_separator.yaml --ckpt   runs/masked_separator/masked_separator_best.ckpt --out_dir runs/masked_separator/analysis/mask_structure --num_samples 1000 --split val
+
+# === JASPAR motif hits: invariant vs env region (full-seq scan, density-normalised) ===
+python -m scripts.analyze_mask_motif_overlap --config configs/enhancer_gosai_masked_separator.yaml --ckpt runs/masked_separator/masked_separator_best.ckpt --out_dir runs/masked_separator/analysis/motif_overlap --num_samples 1000 --split val
