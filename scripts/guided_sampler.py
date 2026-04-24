@@ -164,33 +164,19 @@ class GuidedSampler:
         """
         Returns (grad_mu, grad_sigma2, mu, sigma2), each grad shape (B,L,K).
 
-        NOTE: the manual forward here bypasses SeqRegressor's embedder by
-        feeding a soft-mixture embedding. It must stay in sync with
-        SeqRegressor's architecture. Outstanding review item: #1.
+        Routes through the same PropertyScorer.mu_sigma2 that the eval
+        harness calls — the soft-input path in SeqRegressor.forward handles
+        the continuous (B,L,K) xt, so the gradient is the true derivative
+        of the scorer that gets used at evaluation time.
         """
-        B, L, K = xt.shape
         x = xt.detach().clone().requires_grad_(True)
+        mu, var = self.scorer.mu_sigma2({"seqs": x})          # (B, 1), (B, 1)
 
-        preds = []
-        for m in self.scorer.members:
-            W = m.embedder.weight
-            soft_emb = torch.einsum("blk,kh->blh", x, W)
-            h = soft_emb.transpose(1, 2)
-            xs = [soft_emb]
-            for conv in m.convs:
-                h = torch.tanh(conv(h))
-                xs.append(h.transpose(1, 2))
-            feat = torch.cat(xs, dim=-1)
-            gate = m.sigmoid_linear(feat) * m.tanh_linear(feat)
-            pooled = torch.tanh(gate.mean(dim=1))
-            preds.append(m.final_linear(pooled))
-        preds = torch.stack(preds, dim=0)                    # (K_ens, B, 1)
-        mu = preds.mean(0)
-        var = preds.var(0, unbiased=False)
-
-        grad_mu = torch.autograd.grad(mu.sum(), x, retain_graph=True)[0]
+        grad_mu  = torch.autograd.grad(mu.sum(),  x, retain_graph=True)[0]
         grad_var = torch.autograd.grad(var.sum(), x, retain_graph=False)[0]
 
+        # Project onto the simplex tangent by subtracting the mean over the
+        # alphabet axis — keeps the Dirichlet flow on the simplex.
         grad_mu  = grad_mu  - grad_mu.mean(-1, keepdim=True)
         grad_var = grad_var - grad_var.mean(-1, keepdim=True)
         return grad_mu.detach(), grad_var.detach(), mu.detach(), var.detach()
