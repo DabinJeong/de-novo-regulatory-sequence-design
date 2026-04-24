@@ -29,20 +29,38 @@ class SeqRegressor(nn.Module):
 
     def forward(self, x, mask=None):
         """
-        x: (B, L, A) one-hot (or soft one-hot)
-        mask: (B, L) True/1 = valid token, False/0 = padding (optional)
-        """
-        xs = []
-        out = self.embedder(x['seqs'])
-        xs.append(out)
+        Accepts either discrete token IDs or a soft/continuous distribution
+        over the alphabet. The two paths share every downstream layer so
+        gradient-based guidance (which needs the continuous form) cannot
+        drift from the scorer evaluated on discrete sequences.
 
+        x : dict with key 'seqs', or a raw tensor. Two accepted shapes for
+            seqs:
+              (B, L)          long   -> standard embedding lookup
+              (B, L, A)       float  -> soft lookup via seqs @ embedder.weight
+                                        (identical to einsum 'bla,ah->blh'),
+                                        so grads flow back into seqs.
+        mask : (B, L) 1 = valid, 0 = padding. Optional.
+        """
+        seqs = x['seqs'] if isinstance(x, dict) else x
+
+        if seqs.dim() == 2:
+            out = self.embedder(seqs)
+        elif seqs.dim() == 3:
+            out = seqs @ self.embedder.weight
+        else:
+            raise ValueError(
+                f"SeqRegressor.forward expected (B,L) long or (B,L,A) float, "
+                f"got shape {tuple(seqs.shape)}"
+            )
+
+        xs = [out]
         h = out.transpose(1, 2)
         for conv in self.convs:
             h = torch.tanh(conv(h))
             xs.append(h.transpose(1, 2))
 
         feat = torch.cat(xs, dim=-1)
-
         gate = self.sigmoid_linear(feat) * self.tanh_linear(feat)
 
         if mask is not None:
