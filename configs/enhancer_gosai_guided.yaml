@@ -37,7 +37,7 @@ loader:
 # the values used during training so MaskedSeparatorModel loads the checkpoint.
 masked_separator:
   checkpoint_path: ./runs/masked_separator/masked_separator_best.ckpt
-  target_idx: null    # null -> regress on mean(hepg2, k562, sknsh)
+  target_idx: 0       # 0=hepg2, 1=k562, 2=sknsh (must match trainer)
   num_envs: 3         # K for K-means env inference (architectural)
   init_rho: 0.3       # target stable ratio used at init
 
