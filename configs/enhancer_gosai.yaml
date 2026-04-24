@@ -69,7 +69,7 @@ eval:
   subset_size: 5000
 
 masked_separator:
-  target_idx: null          # null -> regress on mean(hepg2, k562, sknsh)
+  target_idx: 0             # 0=hepg2, 1=k562, 2=sknsh (must match trainer)
   beta_inv: 1.0             # V-REx penalty weight
   lambda_reg: 1.0           # mask regularisation weight
   init_rho: 0.3             # initial learnable stable ratio
