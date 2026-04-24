@@ -153,33 +153,42 @@ def scan_hits_with_positions(
 # ------------------------------------------------------------------
 def classify_and_aggregate(
     seqs: List[str],
-    hard_mask: np.ndarray,
+    env_mask: np.ndarray,
     env_ids: np.ndarray,
     per_seq_hits: List[List[Tuple[int, int, int]]],
     motif_ids: List[str],
     num_envs: int,
+    env_overlap_threshold: float = 0.5,
 ) -> Dict:
     """
-    For each hit, overlap_frac = mean(hard_mask[start:end]). overlap >= 0.5
-    is env (bucketed by env_ids[seq]); else invariant.
+    MaskedSeparator convention: M >= threshold selects the invariant (x_st)
+    positions; M < threshold selects the env (x_en) positions. Here
+    ``env_mask[i, l] == 1`` iff position l of sequence i is env-variable
+    (i.e. M_soft < mask_threshold). For each motif hit spanning [s, e),
+
+        overlap_frac = mean(env_mask[i, s:e])
+
+    is the fraction of the footprint that falls in the env region. A hit is
+    classified as env (and bucketed by the sequence's env_id) when
+    overlap_frac >= env_overlap_threshold; otherwise invariant.
     """
     N = len(seqs)
-    L = hard_mask.shape[1]
+    L = env_mask.shape[1]
     M_motifs = len(motif_ids)
 
     region_labels = ["invariant"] + [f"env{k}" for k in range(num_envs)]
-    # region -> seqs considered for that region (for coverage + bp denom)
+    # region -> seqs considered for that region (for coverage + bp denom).
+    # Invariant bp is shared across all sequences; env bp is specific to the
+    # env-group each sequence was assigned to.
     region_seqs: Dict[str, List[int]] = {"invariant": list(range(N))}
     for k in range(num_envs):
         region_seqs[f"env{k}"] = list(np.where(env_ids == k)[0])
 
-    # bp denom: invariant counts (L - hard_sum) over ALL seqs;
-    # env_k counts hard_sum over seqs in group k.
     bp_total: Dict[str, int] = {}
-    bp_total["invariant"] = int((L - hard_mask.sum(axis=1)).sum())
+    bp_total["invariant"] = int((L - env_mask.sum(axis=1)).sum())
     for k in range(num_envs):
         sel = env_ids == k
-        bp_total[f"env{k}"] = int(hard_mask[sel].sum()) if sel.any() else 0
+        bp_total[f"env{k}"] = int(env_mask[sel].sum()) if sel.any() else 0
 
     # Per-seq hit totals per region, and per-motif-per-region counts.
     per_seq_region_hits = {lab: np.zeros(N, dtype=np.int64) for lab in region_labels}
@@ -191,9 +200,9 @@ def classify_and_aggregate(
     for i, hits in enumerate(per_seq_hits):
         env_k = int(env_ids[i])
         for (j, s, e) in hits:
-            frac = float(hard_mask[i, s:e].mean())
+            frac = float(env_mask[i, s:e].mean())
             overlap_fracs.append(frac)
-            if frac >= 0.5:
+            if frac >= env_overlap_threshold:
                 lab = f"env{env_k}"
             else:
                 lab = "invariant"
@@ -321,9 +330,12 @@ def main():
         num_envs=num_envs,
         centroids=centroids,
     )
-    hard_mask = (M_soft >= args.mask_threshold).astype(np.int8)
-    print(f"[mask] N={len(seqs)}  L={hard_mask.shape[1]}  "
-          f"mean(hard)={hard_mask.mean():.3f}  "
+    # MaskedSeparator convention: M >= threshold => invariant (x_st).
+    # We care about env-region overlap, so env_mask=1 at env-variable
+    # positions (M < threshold) and 0 at invariant positions.
+    env_mask = (M_soft < args.mask_threshold).astype(np.int8)
+    print(f"[mask] N={len(seqs)}  L={env_mask.shape[1]}  "
+          f"mean(env)={env_mask.mean():.3f}  "
           f"env_sizes={[int((env_ids == k).sum()) for k in range(num_envs)]}")
 
     # 2) JASPAR PWMs + thresholds
@@ -348,7 +360,8 @@ def main():
 
     # 4) classify + aggregate
     agg = classify_and_aggregate(
-        seqs, hard_mask, env_ids, per_seq_hits, motif_ids, num_envs,
+        seqs, env_mask, env_ids, per_seq_hits, motif_ids, num_envs,
+        env_overlap_threshold=args.env_overlap_threshold,
     )
     summary_df = agg["summary_df"]
     per_motif_df = agg["per_motif_df"]
@@ -369,12 +382,13 @@ def main():
             "ckpt": args.ckpt,
             "split": args.split,
             "num_samples": len(seqs),
-            "seq_length": int(hard_mask.shape[1]),
+            "seq_length": int(env_mask.shape[1]),
             "mask_threshold": args.mask_threshold,
             "env_overlap_threshold": args.env_overlap_threshold,
             "num_envs": num_envs,
             "env_sizes": [int((env_ids == k).sum()) for k in range(num_envs)],
-            "mean_hard_mask": float(hard_mask.mean()),
+            "mean_env_fraction": float(env_mask.mean()),
+            "mean_invariant_fraction": float(1.0 - env_mask.mean()),
             "jaspar_release": args.jaspar_release,
             "jaspar_collection": args.jaspar_collection,
             "jaspar_tax_group": args.jaspar_tax_group,
