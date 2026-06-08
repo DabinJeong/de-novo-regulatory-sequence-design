@@ -1,4 +1,4 @@
-# De novo sequence generation with uncertainty control + property optimization
+# De novo sequence generation
 
 ## Installation
 The environment required to run {our model} can be installed like so:
